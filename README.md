@@ -69,6 +69,12 @@ This template includes a reusable GitHub Actions workflow in
 | `SF_USERNAME` | SourceForge upload |
 | `SF_PASSWORD` | SourceForge upload |
 
+## Documentation
+
+Full documentation and edition creation guides:
+
+➡️ **https://acreetionos.org/wiki.conf**
+
 ## License
 
 GPL-3.0 — see [LICENSE](LICENSE).
