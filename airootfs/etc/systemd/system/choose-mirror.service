@@ -1,0 +1,12 @@
+[Unit]
+Description=Choose mirror
+Requires=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/choose-mirror
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

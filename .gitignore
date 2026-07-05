@@ -1,0 +1,22 @@
+# Build artifacts
+work/
+out/
+*.iso
+*.iso.*
+ISO/
+
+# System files
+*~
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Build logs
+*.log

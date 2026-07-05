@@ -1,0 +1,13 @@
+[Unit]
+Description=Initialize pacman keyring
+After=etc-pacman.d-gnupg.mount
+Before=reflector.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/pacman-key --init
+ExecStart=/usr/bin/pacman-key --populate archlinux acreetionos
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

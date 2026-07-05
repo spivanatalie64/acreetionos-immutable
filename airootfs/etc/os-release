@@ -1,0 +1,7 @@
+NAME="AcreetionOS"
+ID=acreetionos
+PRETTY_NAME="AcreetionOS Immutable"
+VERSION_ID="1.0"
+HOME_URL="https://acreetionos.org"
+SUPPORT_URL="https://discord.gg/VHqQkJASw7"
+BUG_REPORT_URL="https://github.com/spivanatalie64/acreetionos-immutable/issues"

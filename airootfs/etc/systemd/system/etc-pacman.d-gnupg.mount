@@ -1,0 +1,11 @@
+[Unit]
+Description=Make pacman's gnupg directory a tempfs
+DefaultDependencies=no
+Before=local-fs.target
+ConditionPathExists=/etc/pacman.d/gnupg
+
+[Mount]
+What=tmpfs
+Where=/etc/pacman.d/gnupg
+Type=tmpfs
+Options=nodev,nosuid,mode=755

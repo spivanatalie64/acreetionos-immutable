@@ -1,0 +1,12 @@
+################################################################################
+# AcreetionOS Immutable — Meta-Package Based Build
+# 
+# This file ONLY contains the edition meta-package.
+# The meta-package (acreetionos-immutable) defines ALL dependencies
+# for this edition — desktop environment, apps, drivers, everything.
+#
+# To add/remove packages from this edition, edit:
+#   ~/Projects/Packages/AcreetionOS/acreetionos-immutable/PKGBUILD
+################################################################################
+
+acreetionos-immutable
