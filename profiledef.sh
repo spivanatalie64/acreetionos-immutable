@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2034
-# profiledef.sh — AcreetionOS Edition Template
-# Edition: Immutable
-# Customize these values for your edition.
+# profiledef.sh — AcreetionOS Immutable Edition
+# Self-contained archiso profile. Builds standalone from standard Arch mirrors.
 
 iso_name="AcreetionOS-Immutable"
-iso_label="acreetionOS_IMMUTABLE_$(date --date="@${SOURCE_DATE_EPOCH:-$(date +%s)}" +%Y%m)"
-iso_publisher="Acreetion OS"
+iso_label="acreetionOS_immutable_202608"
+iso_publisher="Acreetion OS Community"
 iso_application="Acreetion OS Immutable Filesystem Community Edition"
 iso_version="1.0"
 install_dir="arch"
 buildmodes=('iso')
-bootmodes=('bios.syslinux' 'uefi.grub')
+bootmodes=('bios.syslinux' 'uefi.grub' )
 arch="x86_64"
 pacman_conf="pacman.conf"
 airootfs_image_type="squashfs"
@@ -27,8 +26,4 @@ file_permissions=(
   ["/usr/local/bin/choose-mirror"]="0:0:755"
   ["/usr/local/bin/Installation_guide"]="0:0:755"
   ["/usr/local/bin/livecd-sound"]="0:0:755"
-  ["/usr/bin/fixkeys.sh"]="0:0:755"
-  ["/usr/local/bin/postinstall.sh"]="0:0:755"
-  ["/usr/local/bin/preinstall"]="0:0:755"
-  ["/usr/bin/wifi-connection"]="0:0:755"
 )

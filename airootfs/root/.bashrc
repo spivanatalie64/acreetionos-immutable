@@ -11,5 +11,5 @@ alias ..='cd ..'
 
 PS1='\[\e[1;32m\][\u@\h \W]\$\[\e[0m\] '
 
-echo "Welcome to AcreetionOS Immutable Live!"
+echo "Welcome to AcreetionOS XFCE Live!"
 echo "Type 'installation_guide' for setup instructions."

@@ -1,80 +1,44 @@
-# AcreetionOS Edition Template
+# AcreetionOS Immutable Edition
 
-**Base template for creating AcreetionOS community editions.**
+A locked-down, atomic-update foundation. Stable by design.
 
-This repo provides the minimal archiso profile infrastructure — bootloaders,
-live environment configs, build scripts — without any desktop environment
-or display server. Use it as a starting point for new editions.
+> A self-contained [AcreetionOS](https://acreetionos.org) community edition.
+> Builds standalone from standard Arch Linux mirrors — no custom repos required.
 
-## Usage
+## Features
 
-1. **Fork or copy** this repo
-2. **Replace placeholders** in these files:
-   - `profiledef.sh` — edition name, label, description, version
-   - `packages.x86_64` — add your edition-specific packages
-   - `airootfs/etc/os-release` — update edition info
-   - `build.sh` — edition name in echo messages
-   - `mkarchiso.sh` — edition label
-3. **Customize** `airootfs/` with your edition's configs and scripts
-4. **Build** with `./build.sh`
+- Immutable root layout
+- LightDM display manager
+- Cinnamon desktop
+- Atomic updates
 
-## Placeholder Reference
+## Build
 
-| Placeholder | Description |
-|-------------|-------------|
-| `Immutable` | Human-readable edition name (e.g., "XFCE") |
-| `IMMUTABLE` | Short label for ISO volume (e.g., "XFCE") |
-| `Immutable Filesystem Community Edition` | Short description |
-| `immutable` | GitHub repo name suffix |
+Requirements: `archiso` (or Docker/Podman with an `archlinux:latest` image).
 
-## Directory Structure
-
-```
-├── profiledef.sh          # ISO metadata & file permissions
-├── packages.x86_64        # Package list (base + edition)
-├── pacman.conf            # Repository configuration
-├── bootstrap_packages.x86_64
-├── build.sh               # Build entry point
-├── mkarchiso.sh           # mkarchiso wrapper
-├── refresh.sh             # Cleanup script
-├── generate-build-info.sh # Build metadata
-├── grub/                  # GRUB bootloader configs
-├── syslinux/              # SYSLINUX bootloader configs
-├── efiboot/               # EFI boot files
-├── airootfs/              # Live root filesystem overlay
-│   ├── etc/               # System configs
-│   ├── root/              # Root user files
-│   └── usr/               # User binaries & scripts
-└── .github/workflows/     # GitHub Actions CI
+```bash
+git clone https://github.com/spivanatalie64/acreetionos-immutable.git
+cd acreetionos-immutable
+./build.sh
 ```
 
-## Build Requirements
+The ISO lands in `../ISO/`. Checksums are generated alongside.
 
-- `archiso` package
-- `sudo` access
-- ~10GB free disk space for the build
+## Layout
 
-## CI/CD
+| Path | Purpose |
+|------|---------|
+| `profiledef.sh` | Edition metadata (name, label, arch, boot modes) |
+| `packages.x86_64` | Static package list (verified against Arch repos) |
+| `pacman.conf` | Standard Arch mirrors (legacy custom repos commented) |
+| `airootfs/` | Live-environment overlay (DMs, configs, wallpapers) |
+| `grub/` `syslinux/` `efiboot/` | Bootloader configs |
+| `.github/workflows/` | CI: weekly ISO build + linting |
 
-This template includes a reusable GitHub Actions workflow in
-`.github/workflows/build.yml`. Set the following secrets for upload targets:
+## Community
 
-| Secret | Purpose |
-|--------|---------|
-| `CLOUDFLARE_ACCOUNT_ID` | R2 upload |
-| `CLOUDFLARE_API_TOKEN` | R2 upload |
-| `CLOUDFLARE_EMAIL` | R2 upload |
-| `IA_ACCESS_KEY` | Internet Archive upload |
-| `IA_SECRET_KEY` | Internet Archive upload |
-| `SF_USERNAME` | SourceForge upload |
-| `SF_PASSWORD` | SourceForge upload |
+- **Discord:** AcreetionOS Community Server
+- **Issues:** https://github.com/spivanatalie64/acreetionos-immutable/issues
+- **Website:** https://acreetionos.org
 
-## Documentation
-
-Full documentation and edition creation guides:
-
-➡️ **https://acreetionos.org/wiki.conf**
-
-## License
-
-GPL-3.0 — see [LICENSE](LICENSE).
+Licensed under [GPL-3.0](LICENSE).

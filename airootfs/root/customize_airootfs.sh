@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # customize_airootfs.sh — runs inside the build chroot before squashing
-# Use this to set up the live environment for your edition.
+# Sets up the live environment for the edition.
 
 set -e
 
@@ -11,22 +11,22 @@ locale-gen
 # Set timezone
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime
 
-# Enable services
-systemctl enable NetworkManager.service
-systemctl enable sshd.service
-systemctl enable choose-mirror.service
-systemctl enable pacman-init.service
-systemctl enable reflector.service
-systemctl enable chronyd.service
+# Enable core services (only those whose units exist)
+for svc in NetworkManager.service sshd.service choose-mirror.service \
+           pacman-init.service reflector.service chronyd.service; do
+  if [ -e "/usr/lib/systemd/system/$svc" ] || [ -e "/etc/systemd/system/$svc" ]; then
+    systemctl enable "$svc" || true
+  fi
+done
 
 # Set root password (empty by default — change for production)
 passwd -d root
 
 # Create /etc/hosts
-cat > /etc/hosts <<- EOF
+cat > /etc/hosts <<- 'HOSTS_EOF'
 127.0.0.1   localhost
 ::1         localhost
 127.0.1.1   acreetionos-live.localdomain acreetionos-live
-EOF
+HOSTS_EOF
 
 echo "customize_airootfs.sh: done"

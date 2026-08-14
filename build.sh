@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build.sh — Build AcreetionOS Immutable ISO
+# build.sh — Build AcreetionOS-Immutable ISO
 # Usage: ./build.sh
 
 set -euo pipefail
@@ -9,23 +9,19 @@ OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/../ISO}"
 
 cd "$SCRIPT_DIR"
 
-echo "  :: AcreetionOS Immutable — Building ISO"
+echo "  :: AcreetionOS-Immutable — Building ISO"
 echo "  :: Output: ${OUTPUT_DIR}"
 
-# Generate build metadata
 if [ -f ./generate-build-info.sh ]; then
   ./generate-build-info.sh
 fi
 
-# Clean previous build
 echo "  :: Cleaning workspace..."
 ./refresh.sh -j 2>/dev/null || true
 
-# Build
 echo "  :: Running mkarchiso..."
 ./mkarchiso.sh
 
-# Find and report ISO
 FOUND_ISO=$(find "${OUTPUT_DIR}" -name "AcreetionOS-Immutable*.iso" -type f 2>/dev/null | head -1)
 if [ -n "$FOUND_ISO" ]; then
   echo "  ✓ ISO: $FOUND_ISO"
@@ -37,6 +33,5 @@ else
   ls -lh out/ 2>/dev/null || true
 fi
 
-# Clean up work dir
 sudo rm -rf ./work 2>/dev/null || true
 echo "  :: Done!"

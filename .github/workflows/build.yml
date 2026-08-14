@@ -1,37 +1,38 @@
-# ==============================================================================
-# AcreetionOS Immutable — Weekly ISO Build
-# Calls the shared reusable workflow from acreetionos-build-workflows
-# ==============================================================================
-
-name: Build Immutable ISO
+name: Build AcreetionOS-Immutable ISO
 
 on:
+  push:
+    branches: [main]
   schedule:
-    - cron: '0 6 * * 1'   # Every Monday at 06:00 UTC
+    - cron: '0 6 * * 1'
   workflow_dispatch:
-    inputs:
-      version_suffix:
-        description: "Optional version suffix (e.g., rc1, hotfix)"
-        required: false
-        type: string
 
 jobs:
   build:
-    uses: spivanatalie64/acreetionos-build-workflows/.github/workflows/build-iso.yml@main
-    with:
-      edition-name: "Immutable"
-      edition-label: "IMMUTABLE"
-      edition-repo: "immutable"
-      edition-description: "Immutable Filesystem Community Edition"
-      r2-bucket: "acreetionos-immutable"
-      ia-prefix: "AcreetionOS-Immutable"
-      sf-path: "acreetionos-iso-image/immutable"
-    secrets:
-      cf-account-id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      cf-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      cf-email: ${{ secrets.CLOUDFLARE_EMAIL }}
-      ia-access-key: ${{ secrets.IA_ACCESS_KEY }}
-      ia-secret-key: ${{ secrets.IA_SECRET_KEY }}
-      sf-username: ${{ secrets.SF_USERNAME }}
-      sf-password: ${{ secrets.SF_PASSWORD }}
-      gh-token: ${{ secrets.GITHUB_TOKEN }}
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+      options: --privileged
+    timeout-minutes: 180
+    steps:
+      - name: Install deps
+        run: |
+          pacman -Sy --noconfirm archlinux-keyring
+          pacman -S --noconfirm --needed archiso squashfs-tools dosfstools erofs-utils mtools xorriso libarchive grub edk2-shell git
+      - uses: actions/checkout@v4
+      - name: Build ISO
+        run: |
+          chmod +x build.sh
+          ./build.sh 2>&1
+      - name: Checksums
+        run: |
+          for f in ../ISO/*.iso; do
+            [ -f "$f" ] || continue
+            sha256sum "$f" >> SHA256SUMS
+          done
+      - name: Upload ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: AcreetionOS-Immutable
+          path: ../ISO/*.iso
+          retention-days: 7
