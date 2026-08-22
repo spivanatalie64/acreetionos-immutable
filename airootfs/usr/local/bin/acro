@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+# acro — AcreetionOS Immutable system manager.
+#
+# Layout of an installed AcreetionOS Immutable system (btrfs):
+#   @          -> /             mounted READ-ONLY (the OS itself)
+#   @home      -> /home         writable
+#   @var       -> /var          writable
+#   @snapshots -> /.snapshots   writable, holds read-only snapshots of @
+#
+# The OS root is never modified casually: updates run as snapshotted
+# transactions, and every update can record its exact /usr state into a
+# local OSTree repository for history and diffing.
+
+set -euo pipefail
+
+readonly SNAP_DIR="/.snapshots"
+readonly OSTREE_REPO="${SNAP_DIR}/.acro-ostree"
+readonly OSTREE_BRANCH="acreetionos/usr"
+
+C_VIOLET='\033[1;35m'
+C_DIM='\033[2m'
+C_RST='\033[0m'
+
+die() {
+	printf 'acro: %s\n' "$*" >&2
+	exit 1
+}
+
+info() {
+	printf '%b::%b %s\n' "${C_VIOLET}" "${C_RST}" "$*"
+}
+
+usage() {
+	cat <<EOF
+acro — AcreetionOS Immutable system manager
+
+  status                    show immutability state, snapshots and history
+  unlock                    remount / writable (until next boot or 'lock')
+  lock                      remount / read-only again
+  update [--yes]            snapshot -> pacman -Syu -> re-lock (atomic-ish)
+  snapshot create [label]   manual read-only snapshot of the running system
+  snapshot list             list snapshots
+  snapshot delete <name>    delete one snapshot
+  snapshot prune [keep]     keep newest N snapshots (default 5)
+  rollback <name>           promote a snapshot to be the new root (reboot after)
+  ostree-commit             record current /usr state into local OSTree history
+  ostree-diff               diff the two most recent recorded /usr states
+  apps                      set up Flatpak/Flathub and update user-space apps
+
+Installed systems boot with / read-only. Use 'update' for OS changes;
+install applications with Flatpak ('acro apps') so they stay out of the
+immutable base.
+EOF
+}
+
+require_root() {
+	[[ ${EUID} -eq 0 ]] || die "must be run as root"
+}
+
+require_installed_system() {
+	require_root
+	local fstype
+	fstype="$(findmnt -nro FSTYPE / || true)"
+	[[ ${fstype} == "btrfs" ]] || die "/ is not btrfs — this is not an immutable install"
+	findmnt -n "${SNAP_DIR}" >/dev/null 2>&1 ||
+		die "no snapshot mount at ${SNAP_DIR} — not an immutable install?"
+	command -v btrfs >/dev/null 2>&1 || die "btrfs-progs missing"
+}
+
+root_source() {
+	findmnt -nro SOURCE / | cut -d'[' -f1
+}
+
+snapshot_create() {
+	local label="${1:-manual}"
+	local name stamp
+	stamp="$(date +%Y%m%d-%H%M%S)"
+	name="${stamp}-${label}"
+	btrfs subvolume snapshot -r / "${SNAP_DIR}/${name}" >/dev/null
+	printf '%s\n' "${name}"
+}
+
+cmd_status() {
+	local subvol ro_state snap_count
+	subvol="$(findmnt -nro OPTIONS / | grep -o 'subvol=[^,]*' || true)"
+	if findmnt -nro OPTIONS / | grep -qw ro; then
+		ro_state="read-only 🔒"
+	else
+		ro_state="WRITABLE (unlocked!)"
+	fi
+	snap_count=0
+	[[ -d ${SNAP_DIR} ]] && snap_count="$(find "${SNAP_DIR}" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+
+	info "AcreetionOS Immutable — $(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2 || echo unknown)"
+	printf '  root        : %s (%s, %s)\n' "$(findmnt -nro SOURCE /)" "${subvol:-?}" "${ro_state}"
+	printf '  snapshots   : %s in %s\n' "${snap_count}" "${SNAP_DIR}"
+
+	if [[ -d ${OSTREE_REPO} ]]; then
+		printf '  usr history :\n'
+		ostree --repo="${OSTREE_REPO}" log "${OSTREE_BRANCH}" 2>/dev/null |
+			grep -E '^commit|^Date|^    (acr|pacman)' | head -12 || true
+	else
+		printf '  usr history : %b(empty — recorded on first %s)%b\n' \
+			"${C_DIM}" "acro update" "${C_RST}"
+	fi
+
+	if [[ -d ${SNAP_DIR} ]] && compgen -G "${SNAP_DIR}/*" >/dev/null; then
+		printf '  latest      : '
+		find "${SNAP_DIR}" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %f\n' 2>/dev/null |
+			sort -rn | head -3 | cut -d' ' -f2- | tr '\n' ' '
+		printf '\n'
+	fi
+}
+
+cmd_unlock() {
+	require_installed_system
+	mount -o remount,rw /
+	info "root is now WRITABLE — remember to 'acro lock' (or just reboot)"
+}
+
+cmd_lock() {
+	require_installed_system
+	mount -o remount,ro /
+	info "root is read-only again 🔒"
+}
+
+cmd_snapshot() {
+	[[ $# -ge 1 ]] || die "snapshot create|list|delete|prune"
+	case "$1" in
+	create)
+		shift
+		require_installed_system
+		name="$(snapshot_create "${*:-manual}")"
+		info "created snapshot: ${name}"
+		;;
+	list)
+		require_installed_system
+		local d
+		for d in "${SNAP_DIR}"/*; do
+			[[ -d ${d} ]] || continue
+			local flag=""
+			btrfs property get "${d}" ro 2>/dev/null | grep -q true && flag=" (ro)"
+			printf '%s%s\n' "$(basename "${d}")" "${flag}"
+		done
+		;;
+	delete)
+		shift
+		[[ $# -eq 1 ]] || die "snapshot delete <name>"
+		local target="${SNAP_DIR}/$1"
+		[[ -d ${target} ]] || die "no such snapshot: $1"
+		btrfs property set "${target}" ro false
+		btrfs subvolume delete "${target}" >/dev/null
+		info "deleted: $1"
+		;;
+	prune)
+		shift
+		local keep="${1:-5}"
+		require_installed_system
+		mapfile -t snaps < <(find "${SNAP_DIR}" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %f\n' | sort -rn | cut -d' ' -f2-)
+		if ((${#snaps[@]} <= keep)); then
+			info "nothing to prune (${#snaps[@]} <= ${keep})"
+			return 0
+		fi
+		local old
+		for old in "${snaps[@]:keep}"; do
+			btrfs property set "${SNAP_DIR}/${old}" ro false
+			btrfs subvolume delete "${SNAP_DIR}/${old}" >/dev/null
+			info "pruned: ${old}"
+		done
+		;;
+	*)
+		die "unknown snapshot action: $1"
+		;;
+	esac
+}
+
+cmd_update() {
+	require_installed_system
+	local yes_flag=""
+	if [[ "${1:-}" == "--yes" || "${1:-}" == "-y" ]]; then
+		yes_flag="--noconfirm"
+		shift
+	fi
+
+	pgrep -x pacman >/dev/null 2>&1 && die "another pacman transaction is running"
+
+	info "taking pre-update snapshot..."
+	local name
+	name="$(snapshot_create pre-update)"
+	info "snapshot: ${name}"
+
+	info "unlocking root for transaction..."
+	mount -o remount,rw /
+
+	local rc=0
+	pacman -Syu ${yes_flag} "$@" || rc=$?
+
+	if ((rc != 0)); then
+		printf '\n'
+		die "update FAILED (rc=${rc}) — system left WRITABLE for repair; run 'acro lock' when done"
+	fi
+
+	cmd_ostree_commit --quiet || info "note: ostree history recording skipped"
+
+	mount -o remount,ro /
+	info "update complete — root locked again 🔒"
+	info "a reboot applies new kernels cleanly."
+}
+
+cmd_rollback() {
+	require_root
+	[[ $# -eq 1 ]] || die "rollback <snapshot-name>  (see: acro snapshot list)"
+	local name="$1"
+	local target="${SNAP_DIR}/${name}"
+	[[ -d ${target} ]] || die "no such snapshot: ${name}"
+
+	printf '%bWARNING:%b this renames your current root to @broken-<ts> and\n' "${C_VIOLET}" "${C_RST}"
+	printf 'promotes "%s" to be the new root. Reboot afterwards.\n' "${name}"
+	local reply
+	read -r -p "Type ROLLBACK to continue: " reply
+	[[ ${reply} == "ROLLBACK" ]] || die "aborted"
+
+	local src top
+	src="$(root_source)"
+	top="/mnt/acro-top.$(date +%s)"
+	mkdir -p "${top}"
+
+	info "mounting btrfs top level (${src})..."
+	mount -o subvolid=5 "${src}" "${top}"
+
+	local broken
+	broken="@broken-$(date +%Y%m%d-%H%M%S)"
+	mv "${top}/@" "${top}/${broken}"
+	btrfs subvolume snapshot "${top}/@snapshots/${name}" "${top}/@" >/dev/null
+
+	umount "${top}"
+	rmdir "${top}"
+	info "done. old root kept as: ${broken}"
+	info "reboot now to boot into \"${name}\"."
+	info "(once verified you may delete ${broken} to reclaim space)"
+}
+
+cmd_ostree_commit() {
+	require_installed_system
+	local quiet=""
+	if [[ "${1:-}" == "--quiet" ]]; then
+		quiet="yes"
+	fi
+	if ! command -v ostree >/dev/null 2>&1; then
+		[[ -n ${quiet} ]] || die "ostree is not installed"
+		return 0
+	fi
+	if [[ ! -d ${OSTREE_REPO} ]]; then
+		[[ -n ${quiet} ]] || info "initializing OSTree repo at ${OSTREE_REPO} (first run takes a while)..."
+		ostree init --repo="${OSTREE_REPO}" --mode=archive
+	fi
+	pgrep -x pacman >/dev/null 2>&1 &&
+		{ [[ -n ${quiet} ]] || die "pacman running — try later"; return 0; }
+	[[ -n ${quiet} ]] || info "recording /usr state into OSTree history (deduplicated)..."
+	ostree --repo="${OSTREE_REPO}" commit \
+		--branch="${OSTREE_BRANCH}" \
+		--tree=dir=/usr \
+		--subject="usr state $(date +%F_%H:%M)" >/dev/null
+	[[ -n ${quiet} ]] || info "recorded: $(ostree --repo="${OSTREE_REPO}" rev-parse "${OSTREE_BRANCH}")"
+}
+
+cmd_ostree_diff() {
+	require_installed_system
+	[[ -d ${OSTREE_REPO} ]] || die "no OSTree history yet — run 'acro update' first"
+	local head parent
+	head="$(ostree --repo="${OSTREE_REPO}" rev-parse "${OSTREE_BRANCH}")"
+	parent="$(ostree --repo="${OSTREE_REPO}" rev-parse "${OSTREE_BRANCH}^" 2>/dev/null || true)"
+	if [[ -z ${parent} ]]; then
+		info "only one recorded state so far:"
+		ostree --repo="${OSTREE_REPO}" log "${OSTREE_BRANCH}" | head -8
+		return 0
+	fi
+	info "diffing previous state vs HEAD:"
+	ostree --repo="${OSTREE_REPO}" diff "${parent}" "${head}" | head -100
+}
+
+cmd_apps() {
+	require_root
+	if ! flatpak remotes 2>/dev/null | grep -q flathub; then
+		info "adding Flathub remote..."
+		flatpak remote-add --if-not-exists flathub \
+			https://flathub.org/repo/flathub.flatpakrepo
+	fi
+	info "updating Flatpak apps + runtimes..."
+	flatpak update --noninteractive || true
+	info "tip: install software with 'flatpak install flathub <app>' — it stays out of the immutable base."
+}
+
+main() {
+	[[ $# -ge 1 ]] || {
+		usage
+		exit 1
+	}
+	case "$1" in
+	status) shift; cmd_status "$@" ;;
+	unlock) shift; cmd_unlock "$@" ;;
+	lock) shift; cmd_lock "$@" ;;
+	update) shift; cmd_update "$@" ;;
+	snapshot) shift; cmd_snapshot "$@" ;;
+	rollback) shift; cmd_rollback "$@" ;;
+	ostree-commit) shift; cmd_ostree_commit "$@" ;;
+	ostree-diff) shift; cmd_ostree_diff "$@" ;;
+	apps) shift; cmd_apps "$@" ;;
+	help | --help | -h) usage ;;
+	*)
+		usage
+		die "unknown command: $1"
+		;;
+	esac
+}
+
+main "$@"

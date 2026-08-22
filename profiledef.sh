@@ -6,7 +6,7 @@ iso_label="acreetionOS_immutable_202608"
 iso_publisher="Acreetion OS Community"
 iso_application="Acreetion OS Immutable Filesystem Community Edition"
 iso_version="1.0"
-install_dir="arch"
+install_dir="acreetionos"
 buildmodes=('iso')
 bootmodes=('bios.syslinux' 'uefi.grub')
 arch="x86_64"
@@ -24,4 +24,6 @@ file_permissions=(
   ["/usr/local/bin/choose-mirror"]="0:0:755"
   ["/usr/local/bin/Installation_guide"]="0:0:755"
   ["/usr/local/bin/livecd-sound"]="0:0:755"
+  ["/usr/local/bin/acro"]="0:0:755"
+  ["/usr/local/bin/acreetionos-install"]="0:0:755"
 )

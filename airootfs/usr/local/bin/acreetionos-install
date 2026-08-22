@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# acreetionos-install — guided installer for AcreetionOS Immutable.
+#
+# Produces a btrfs layout with a read-only OS root:
+#   @          -> /             read-only after install (the immutable base)
+#   @home      -> /home         writable
+#   @var       -> /var          writable
+#   @snapshots -> /.snapshots   writable, holds read-only snapshots of @
+# The ESP is mounted at /boot.
+
+set -euo pipefail
+
+readonly PKG_LIST="/usr/share/acreetionos/packages.x86_64"
+# Packages that only make sense on the live ISO itself.
+readonly ISO_ONLY_PKGS=(
+	mkinitcpio-archiso
+	mkinitcpio-nfs-utils
+	mkinitcpio-busybox
+	mkinitcpio-systemd-tool
+	livecd-sounds
+	espeakup
+)
+
+C_VIOLET='\033[1;35m'
+C_RST='\033[0m'
+
+die() {
+	printf 'install: %s\n' "$*" >&2
+	exit 1
+}
+
+info() {
+	printf '%b::%b %s\n' "${C_VIOLET}" "${C_RST}" "$*"
+}
+
+[[ ${EUID} -eq 0 ]] || die "must be run as root"
+for bin in sgdisk mkfs.vfat mkfs.btrfs pacstrap arch-chroot grub-install blkid partprobe btrfs; do
+	command -v "${bin}" >/dev/null 2>&1 || die "missing required tool: ${bin}"
+done
+[[ -r ${PKG_LIST} ]] || die "package list not found: ${PKG_LIST}"
+
+cat <<'BANNER'
+
+  ┌─────────────────────────────────────────────┐
+  │      AcreetionOS Immutable — Installer      │
+  └─────────────────────────────────────────────┘
+
+BANNER
+
+DISK="${1:-}"
+if [[ -z ${DISK} ]]; then
+	info "available disks:"
+	lsblk -dpno NAME,SIZE,TYPE,MODEL 2>/dev/null | grep -v loop || true
+	read -r -p "Target disk (e.g. /dev/sda): " DISK
+fi
+[[ -b ${DISK} ]] || die "not a block device: ${DISK}"
+
+lsblk -dpno NAME,SIZE,MODEL "${DISK}"
+printf '\nTHIS WILL DESTROY ALL DATA ON %s\n\n' "${DISK}"
+read -r -p "Type YES to continue: " reply
+[[ ${reply} == "YES" ]] || die "aborted"
+
+case "${DISK}" in
+*nvme* | *mmcblk*)
+	P1="${DISK}p1"
+	P2="${DISK}p2"
+	;;
+*)
+	P1="${DISK}1"
+	P2="${DISK}2"
+	;;
+esac
+
+info "partitioning ${DISK}..."
+sgdisk --zap-all "${DISK}"
+sgdisk -n 1:0:+512M -t 1:EF00 -c 1:'acreetionos-esp' "${DISK}"
+sgdisk -n 2:0:0 -t 2:8300 -c 2:'acreetionos-root' "${DISK}"
+partprobe "${DISK}"
+sleep 2
+
+info "formatting..."
+mkfs.vfat -F32 -n ACREETIONOS "${P1}"
+mkfs.btrfs -f -L acreetionos "${P2}"
+
+MNT="$(mktemp -d /tmp/acreetionos-install.XXXXXX)"
+
+info "creating btrfs subvolumes..."
+mount -o compress=zstd:1 "${P2}" "${MNT}"
+for sv in '@' '@home' '@var' '@snapshots'; do
+	btrfs subvolume create "${MNT}/${sv}" >/dev/null
+done
+umount "${MNT}"
+
+info "mounting layout..."
+mount -o noatime,compress=zstd:1,subvol=@ "${P2}" "${MNT}"
+mount --mkdir -o noatime,compress=zstd:1,subvol=@home "${P2}" "${MNT}/home"
+mount --mkdir -o noatime,compress=zstd:1,subvol=@var "${P2}" "${MNT}/var"
+mount --mkdir -o noatime,compress=zstd:1,subvol=@snapshots "${P2}" "${MNT}/.snapshots"
+
+info "mounting ESP at /boot..."
+mount --mkdir "${P1}" "${MNT}/boot"
+
+info "building package list..."
+mapfile -t all_pkgs < <(grep -vE '^[[:space:]]*(#|$)' "${PKG_LIST}")
+pkgs=()
+for p in "${all_pkgs[@]}"; do
+	skip=0
+	for iso_pkg in "${ISO_ONLY_PKGS[@]}"; do
+		if [[ ${p} == "${iso_pkg}" ]]; then
+			skip=1
+			break
+		fi
+	done
+	if ((skip == 0)); then
+		pkgs+=("${p}")
+	fi
+done
+
+info "installing ${#pkgs[@]} packages (this takes a while)..."
+pacstrap -K "${MNT}" "${pkgs[@]}"
+
+install -Dm644 /etc/pacman.d/mirrorlist "${MNT}/etc/pacman.d/mirrorlist"
+install -m755 /usr/local/bin/acro "${MNT}/usr/local/bin/acro"
+
+info "configuring base system..."
+echo 'en_US.UTF-8 UTF-8' >"${MNT}/etc/locale.gen"
+arch-chroot "${MNT}" locale-gen >/dev/null
+
+read -r -p "Timezone [UTC]: " tz
+tz="${tz:-UTC}"
+[[ -e "/usr/share/zoneinfo/${tz}" ]] || die "unknown timezone: ${tz}"
+ln -sf "/usr/share/zoneinfo/${tz}" "${MNT}/etc/localtime"
+
+echo acreetionos >"${MNT}/etc/hostname"
+cat >"${MNT}/etc/hosts" <<'HOSTS'
+127.0.0.1   localhost
+::1         localhost
+127.0.1.1   acreetionos.localdomain acreetionos
+HOSTS
+
+info "writing fstab (root mounts READ-ONLY)..."
+ROOT_UUID="$(blkid -s UUID -o value "${P2}")"
+ESP_UUID="$(blkid -s UUID -o value "${P1}")"
+cat >"${MNT}/etc/fstab" <<FSTAB
+UUID=${ROOT_UUID}  /            btrfs  ro,noatime,compress=zstd:1,subvol=@          0 0
+UUID=${ROOT_UUID}  /home        btrfs  rw,noatime,compress=zstd:1,subvol=@home      0 0
+UUID=${ROOT_UUID}  /var         btrfs  rw,noatime,compress=zstd:1,subvol=@var       0 0
+UUID=${ROOT_UUID}  /.snapshots  btrfs  rw,noatime,compress=zstd:1,subvol=@snapshots 0 0
+UUID=${ESP_UUID}   /boot        vfat   rw,noatime,fmask=0077,dmask=0077             0 2
+FSTAB
+
+arch-chroot "${MNT}" systemctl enable NetworkManager.service lightdm.service chronyd.service
+
+info "set the ROOT password:"
+arch-chroot "${MNT}" passwd
+
+username=""
+while :; do
+	read -r -p "Username to create: " username
+	if [[ ${username} =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+		break
+	fi
+	printf 'invalid username (lowercase letters, digits, -, _)\n'
+done
+arch-chroot "${MNT}" useradd -m -G wheel -s /bin/bash "${username}"
+printf '%%wheel ALL=(ALL:ALL) ALL\n' >"${MNT}/etc/sudoers.d/wheel"
+chmod 440 "${MNT}/etc/sudoers.d/wheel"
+info "set the password for ${username}:"
+arch-chroot "${MNT}" passwd "${username}"
+
+cat >"${MNT}/etc/motd" <<'MOTD'
+
+  Welcome to AcreetionOS Immutable — your root filesystem is READ-ONLY.
+
+    acro status              system, snapshots and usr history overview
+    acro update [--yes]      snapshotted system update, auto re-lock
+    acro apps                Flatpak/Flathub setup + user-space app updates
+    acro help                everything else
+
+  Install software as Flatpaks ('flatpak install flathub <app>') so it
+  stays out of the immutable base.
+  https://acreetionos.org
+
+MOTD
+
+# Brand identity BEFORE grub-mkconfig, so the generated GRUB menu titles
+# say AcreetionOS instead of Arch Linux.
+cat >"${MNT}/etc/os-release" <<'OSREL'
+NAME="AcreetionOS"
+ID=acreetionos
+ID_LIKE="arch"
+VARIANT_ID="immutable"
+PRETTY_NAME="AcreetionOS Immutable"
+VERSION_ID="1.0"
+VERSION="1.0 (Immutable)"
+HOME_URL="https://acreetionos.org"
+SUPPORT_URL="https://discord.gg/VHqQkJASw7"
+BUG_REPORT_URL="https://github.com/spivanatalie64/acreetionos-immutable/issues"
+OSREL
+
+info "installing bootloader..."
+if [[ -d /sys/firmware/efi/efivars ]]; then
+	arch-chroot "${MNT}" grub-install --target=x86_64-efi --efi-directory=/boot \
+		--bootloader-id=ACREETIONOS ||
+		{
+			info "grub-install failed; retrying with removable path..."
+			arch-chroot "${MNT}" grub-install --target=x86_64-efi --efi-directory=/boot \
+				--bootloader-id=ACREETIONOS --removable
+		}
+else
+	arch-chroot "${MNT}" grub-install --target=i386-pc "${DISK}"
+fi
+arch-chroot "${MNT}" grub-mkconfig -o /boot/grub/grub.cfg
+
+sync
+umount -R "${MNT}"
+rmdir "${MNT}"
+
+info "AcreetionOS Immutable installed on ${DISK} — reboot when ready."
+info "First login: run 'acro status'. Apps: 'acro apps' (Flatpak)."

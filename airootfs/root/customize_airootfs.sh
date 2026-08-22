@@ -16,4 +16,15 @@ cat > /etc/hosts <<- 'HOSTS_EOF'
 ::1         localhost
 127.0.1.1   acreetionos-live.localdomain acreetionos-live
 HOSTS_EOF
+cat > /etc/motd <<'MOTD_EOF'
+
+  Welcome to AcreetionOS Immutable (live) — boot the installed system and
+  your root filesystem will be READ-ONLY.
+
+    acro help                immutability manager overview
+    acreetionos-install      install AcreetionOS Immutable to disk
+    Installation_guide       open the Arch installation wiki
+
+MOTD_EOF
+
 echo "customize_airootfs.sh: done"
