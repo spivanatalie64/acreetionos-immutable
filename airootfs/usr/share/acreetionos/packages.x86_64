@@ -139,11 +139,7 @@ vlc
 gnome-system-monitor
 samba
 fastfetch
-base-devel
 git
-python-pip
-rust
-nodejs
 open-vm-tools
 qemu-guest-agent
 virtualbox-guest-utils-nox
@@ -155,5 +151,8 @@ pacman
 dmraid
 
 # --- Immutable edition: snapshot / state / app tooling ---
+# NOTE: no dev toolchains (rust/nodejs/python-pip/base-devel) — they don't
+# belong in the read-only base and the ISO must stay under GitHub's 2GiB
+# release asset cap after xz. Use Flatpak/containers for tooling instead.
 ostree
 flatpak
