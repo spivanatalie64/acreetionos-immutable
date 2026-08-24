@@ -1,0 +1,14 @@
+[Unit]
+Description=AcreetionOS Immutable - commit pending A/B slot after successful boot
+Documentation=man:abroot(8)
+After=local-fs.target network-online.target
+Wants=network-online.target
+ConditionPathExists=/efi/acr/env
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/abroot commit
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

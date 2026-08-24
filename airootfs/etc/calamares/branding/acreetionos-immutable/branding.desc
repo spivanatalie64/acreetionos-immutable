@@ -1,0 +1,25 @@
+# Calamares branding - AcreetionOS Immutable
+---
+componentName: acreetionos-immutable
+
+strings:
+  productName:         AcreetionOS Immutable
+  shortProductName:    Immutable
+  version:             1.0
+  shortVersion:        1.0
+  versionedName:       AcreetionOS Immutable 1.0
+  shortVersionedName:  AcreetionOS Immutable
+  bootloaderEntryName: AcreetionOS Immutable
+
+images:
+  productLogo:         "logo.png"
+  productIcon:         "logo.png"
+  productWallpaper:    "wallpaper.png"
+  slideshow:           "show.qml"
+
+style:
+  sidebarBackground:    "#2c2c2c"
+  sidebarSelect:        "#4d7079"
+
+slideshow: "show.qml"
+slideshowAPI: 1

@@ -1,0 +1,183 @@
+# ═══════════════════════════════════════════════════════════════════
+#  AcreetionOS Immutable ISO Build Pipeline
+#  Branch: acreetionos
+#  Builder: self-hosted shell runner on Dell Precision 7910
+#
+#  RUNNER SETUP (run once on the build server):
+#    gitlab-runner register \
+#      --url https://gitlab.acreetionos.org \
+#      --token <YOUR_RUNNER_TOKEN> \
+#      --executor shell \
+#      --description "acreetionos-builder" \
+#      --tag-list "acreetionos" \
+#      --run-untagged false
+#
+#  The runner user needs passwordless sudo (or run as root).
+#  mkarchiso requires loop device access for squashfs builds.
+# ═══════════════════════════════════════════════════════════════════
+
+stages:
+  - prepare
+  - build
+  - publish
+  - release
+
+variables:
+  ISO_OUT_DIR:   "${CI_PROJECT_DIR}/out"
+  WORK_DIR:      "${CI_PROJECT_DIR}/work"
+  ISO_LABEL:     "AcreetionOS_Immutable"
+  PUBLISH_DIR:   "/srv/http/iso"
+
+workflow:
+  rules:
+    # master (development) and per-version release branches (1.0, 1.1, ...)
+    - if: '$CI_COMMIT_BRANCH == "master"'
+    - if: '$CI_COMMIT_BRANCH =~ /^[0-9]+\.[0-9]+$/'
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+(\.[0-9]+)?$/'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+
+# ───────────────────────────────────────────────────────────────────
+# STAGE 1 – PREPARE
+# Refresh keyring and ensure archiso + build deps are installed
+# ───────────────────────────────────────────────────────────────────
+prepare:deps:
+  stage: prepare
+  tags:
+    - acreetionos
+  script:
+    - echo "==> Initialising pacman keyring..."
+    - pacman-key --init
+    - pacman-key --populate archlinux
+    - echo "==> Refreshing databases and upgrading keyring..."
+    - pacman -Sy --noconfirm --config "${CI_PROJECT_DIR}/pacman.conf" archlinux-keyring
+    - echo "==> Installing archiso build dependencies..."
+    - pacman -S --noconfirm --needed --config "${CI_PROJECT_DIR}/pacman.conf" archiso squashfs-tools dosfstools erofs-utils mtools xorriso libarchive grub edk2-shell
+    - echo "==> Build environment ready."
+    - mkarchiso --version
+  rules:
+    - when: always
+
+# ───────────────────────────────────────────────────────────────────
+# STAGE 2 – BUILD ISO
+# pacman.conf defines:
+#   [acreetionOSREPO-main]  iso.acreetionos.org:8448/repo-main/$arch
+#   [personal]              iso.acreetionos.org:8448/personal
+#   [temp-repo]             iso.acreetionos.org:8448/temp_repo/
+#   IgnorePkg = v4l2loopback-dkms
+#   ParallelDownloads = 25
+# ───────────────────────────────────────────────────────────────────
+build:iso:
+  stage: build
+  tags:
+    - acreetionos
+  needs:
+    - prepare:deps
+  timeout: 3h
+  before_script:
+    - echo "==> Cleaning previous build artifacts..."
+    - rm -rf "${WORK_DIR}" "${ISO_OUT_DIR}"
+    - mkdir -p "${ISO_OUT_DIR}"
+  script:
+    - echo "==> Starting AcreetionOS ISO build..."
+    - echo "    Commit  ${CI_COMMIT_SHORT_SHA}  Branch  ${CI_COMMIT_BRANCH:-tag:$CI_COMMIT_TAG}  Runner  ${CI_RUNNER_DESCRIPTION}"
+    - cd "${CI_PROJECT_DIR}"
+    - mkarchiso -L "${ISO_LABEL}" -v -w "${WORK_DIR}" -o "${ISO_OUT_DIR}" -C "${CI_PROJECT_DIR}/pacman.conf" "${CI_PROJECT_DIR}"
+    - echo "==> Build complete."
+    - ls -lh "${ISO_OUT_DIR}"/*.iso
+    - cd "${ISO_OUT_DIR}"
+    - sha256sum *.iso > SHA256SUMS
+    - md5sum *.iso > MD5SUMS
+    - cat SHA256SUMS
+  after_script:
+    - rm -rf "${WORK_DIR}"
+  artifacts:
+    name: "AcreetionOS-Immutable-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - out/*.iso
+      - out/SHA256SUMS
+      - out/MD5SUMS
+    expire_in: 30 days
+
+# ───────────────────────────────────────────────────────────────────
+# STAGE 3 – PUBLISH
+# Copies ISO to the nginx-served directory, updates latest symlink,
+# keeps the 3 most recent builds and prunes the rest.
+# ───────────────────────────────────────────────────────────────────
+publish:iso:
+  stage: publish
+  tags:
+    - acreetionos
+  needs:
+    - build:iso
+  script:
+    - ISO_FILE=$(ls "${ISO_OUT_DIR}"/*.iso | head -n1)
+    - ISO_NAME=$(basename "${ISO_FILE}")
+    - |
+      if [ -n "${CI_COMMIT_TAG}" ]; then
+        # Tagged (release) builds keep the version in the file name forever
+        PUBLISHED_NAME="AcreetionOS-Immutable-${CI_COMMIT_TAG}.iso"
+      else
+        PUBLISHED_NAME="AcreetionOS-Immutable-$(date +%Y%m%d)-${CI_COMMIT_SHORT_SHA}.iso"
+      fi
+    - echo "==> Publishing ${ISO_NAME} as ${PUBLISHED_NAME}"
+    - mkdir -p "${PUBLISH_DIR}"
+    - cp "${ISO_FILE}" "${PUBLISH_DIR}/${PUBLISHED_NAME}"
+    - sha256sum "${PUBLISH_DIR}/${PUBLISHED_NAME}" > "${PUBLISH_DIR}/SHA256SUMS"
+    - md5sum "${PUBLISH_DIR}/${PUBLISHED_NAME}" > "${PUBLISH_DIR}/MD5SUMS"
+    - ln -sf "${PUBLISH_DIR}/${PUBLISHED_NAME}" "${PUBLISH_DIR}/AcreetionOS-Immutable-latest.iso"
+    # Prune only dated development builds; tagged release ISOs are kept
+    - ls -t "${PUBLISH_DIR}"/AcreetionOS-Immutable-2*.iso 2>/dev/null | tail -n +4 | xargs -r rm -v
+    - echo "==> Done. AcreetionOS-Immutable-latest.iso -> ${PUBLISHED_NAME}"
+    - ls -lh "${PUBLISH_DIR}"/AcreetionOS-Immutable*.iso
+  environment:
+    name: iso-server
+    url: https://iso.acreetionos.org
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      when: on_success
+    - if: '$CI_COMMIT_BRANCH =~ /^[0-9]+\.[0-9]+$/'
+      when: on_success
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+(\.[0-9]+)?$/'
+      when: on_success
+
+# ───────────────────────────────────────────────────────────────────
+# STAGE 4 – RELEASE (tags only)
+# Creates a GitLab Release whose asset links point at the ISO and
+# checksums published to iso.acreetionos.org by the publish stage.
+# ───────────────────────────────────────────────────────────────────
+release:gitlab:
+  stage: release
+  tags:
+    - acreetionos
+  needs:
+    - publish:iso
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+(\.[0-9]+)?$/'
+      when: on_success
+  script:
+    - echo "==> GitLab release for ${CI_COMMIT_TAG} (asset links -> iso.acreetionos.org)"
+  release:
+    tag_name: '${CI_COMMIT_TAG}'
+    name: 'AcreetionOS Immutable ${CI_COMMIT_TAG}'
+    description: |
+      AcreetionOS Immutable ${CI_COMMIT_TAG}
+
+      Atomic dual-root (A/B) edition. Read-only root slots with staged,
+      automatically-committed updates and boot-time rollback.
+
+      ## Download
+      - [AcreetionOS-Immutable-${CI_COMMIT_TAG}.iso](https://iso.acreetionos.org/AcreetionOS-Immutable-${CI_COMMIT_TAG}.iso)
+      - [SHA256SUMS](https://iso.acreetionos.org/SHA256SUMS)
+      - [MD5SUMS](https://iso.acreetionos.org/MD5SUMS)
+
+      Verify: `sha256sum -c SHA256SUMS` after downloading the ISO into the
+      same directory.
+    assets:
+      links:
+        - name: 'AcreetionOS-Immutable-${CI_COMMIT_TAG}.iso'
+          url: 'https://iso.acreetionos.org/AcreetionOS-Immutable-${CI_COMMIT_TAG}.iso'
+        - name: 'SHA256SUMS'
+          url: 'https://iso.acreetionos.org/SHA256SUMS'
+        - name: 'MD5SUMS'
+          url: 'https://iso.acreetionos.org/MD5SUMS'

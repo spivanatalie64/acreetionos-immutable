@@ -1,0 +1,38 @@
+name: GitHub Release
+
+# Creates a GitHub Release whenever a version tag (vX.Y[.Z]) is pushed.
+# The ISO itself is built & published by GitLab CI on iso.acreetionos.org;
+# this release links to those artifacts so both forges stay in sync
+# (the Mirror workflow forwards tags from here to GitLab).
+
+on:
+  push:
+    tags:
+      - 'v*.*'
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub release with download links
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "AcreetionOS Immutable ${VERSION}" \
+            --notes "AcreetionOS Immutable ${VERSION}
+
+Atomic dual-root (A/B) edition. Read-only root slots with staged,
+automatically-committed updates and boot-time rollback.
+
+## Download
+- [AcreetionOS-Immutable-${VERSION}.iso](https://iso.acreetionos.org/AcreetionOS-Immutable-${VERSION}.iso)
+- [SHA256SUMS](https://iso.acreetionos.org/SHA256SUMS)
+- [MD5SUMS](https://iso.acreetionos.org/MD5SUMS)
+
+Verify with \`sha256sum -c SHA256SUMS\`."

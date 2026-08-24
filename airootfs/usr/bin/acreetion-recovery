@@ -1,0 +1,501 @@
+#!/usr/bin/env bash
+##############################################################################
+# acreetion-recovery — AcreetionOS Recovery Environment
+#
+# A Windows-Recovery-style maintenance environment for AcreetionOS and other
+# installed Linux systems. Runs as a themed TUI (whiptail) either:
+#   - at boot, via the "Recovery Environment" boot menu entry
+#     (kernel cmdline: acreetion_recovery=1 systemd.unit=acreetion-recovery.target)
+#   - from the live desktop ("AcreetionOS Recovery" launcher), or manually.
+#
+# Theme palette is taken from the AcreetionOS website (styles.css):
+#   green #2ecc71 / bg #121212 / panel #1a1a1a / box #222222 / border #333333
+#
+# This program is free software; GPL v3 or later. Part of AcreetionOS.
+##############################################################################
+
+set -u
+
+# AcreetionOS brand palette (website styles.css): green #2ecc71 on dark #121212
+DARKBG='#121212'; PANEL='#1a1a1a'; BOXBG='#222222'
+BORDER='#333333'; TEXTB='#e5e5e5'
+
+export NEWT_COLORS="
+root=,$DARKBG
+window=,$BOXBG
+border=green,
+title=black,green
+textbox=,$PANEL
+button=black,green
+actbutton=$TEXTB,$BORDER
+compactbutton=green,
+label=$TEXTB,
+listbox=,$PANEL
+actlistbox=black,green
+sellistbox=,$PANEL
+actsellistbox=black,green
+checkbox=green,
+actcheckbox=$DARKBG,green
+entry=$TEXTB,$PANEL
+form=$TEXTB,$BOXBG
+"
+
+MNT=/mnt/acreetion-recovery
+LOG=/tmp/acreetion-recovery.log
+TARGET=""        # mounted target root (empty = not mounted)
+TARGET_SRC=""    # device of the selected root
+
+BANNER=(
+"   ___   ____  _   _  _____  ____  ___ ___ _____ ___ ___    _   _  ___  _   _"
+"  / _ \\ |  _ \\| \\ | || ____||  _ \\|_ _/ __|_   _|_ _|__ \\ | | | |/ _ \\| \\ | |"
+" | | | || |_) |  \\| ||  _|  | |_) || |\\__ \\ | |  | |  / / | | | | | | |  \\| |"
+" | |_| ||  _ <| |\\  || |___ |  _ < | |___) || |  | | / /_ | |_| | |_| | |\\  |"
+"  \\___/ |_| \\_\\_| \\_||_____||_| \\_\\___|___/ |_| |___|____| \\___/ \\___/|_| \\_\\"
+"                        R e c o v e r y   E n v i r o n m e n t"
+)
+
+msg() { printf '\n\033[1;32m>>>\033[0m %s\n' "$*"; }
+err() { printf '\n\033[1;31m!!!\033[0m %s\n' "$*" | tee -a "$LOG"; }
+
+require_root() {
+    [ "$(id -u)" -eq 0 ] || { err "This tool must run as root."; exit 1; }
+}
+
+apply_console_theme() {
+    # Remap the virtual console palette to the AcreetionOS brand colors so the
+    # whole recovery TTY renders green-on-dark (#2ecc71 on #121212), matching
+    # the website palette. Uses standard VT100 "OSC Ps ; Pt ST" escapes, which
+    # every Linux VT supports - no external tools required.
+    local esc=$'\033'
+    local p="${esc}]P"
+    # black -> #121212 bg, green/bright-green -> #2ecc71, magenta -> #9b59b6,
+    # cyan/blue accents -> #61afef, white -> #e5e5e5
+    printf '%s' \
+        "${p}0121212" \
+        "${p}1cd0000" \
+        "${p}22ecc71" \
+        "${p}3d7a870" \
+        "${p}42f60c0" \
+        "${p}5b350ce" \
+        "${p}610b0be" \
+        "${p}78a8a8a" \
+        "${p}8555555" \
+        "${p}9ff6c60" \
+        "${p}a2ecc71" \
+        "${p}bf5fd87" \
+        "${p}c61afef" \
+        "${p}de06c75" \
+        "${p}e56b6c7" \
+        "${p}fe5e5e5"
+    return 0
+}
+
+show_banner() {
+    clear
+    tput bold 2>/dev/null
+    printf '\n'
+    for line in "${BANNER[@]}"; do printf ' \033[1;32m%s\033[0m\n' "$line"; done
+    tput sgr0 2>/dev/null
+    printf ' \033[0;37mAcreetionOS Recovery Environment — system restore & repair tools\033[0m\n'
+    printf ' \033[0;37mSession log: %s\033[0m\n\n' "$LOG"
+}
+
+wt() { whiptail --backtitle "AcreetionOS Recovery Environment" "$@"; }
+
+info_box()  { wt --title " $1 " --msgbox "$2" "${3:-22}" "${4:-76}"; }
+confirm()   { wt --title " $1 " --yesno "$2" "${3:-10}" "${4:-70}"; }
+
+pause_ok() { wt --title " Done " --msgbox "$1" 14 74; }
+
+run_in_terminal() {
+    # Run a long operation full-screen, streaming output, then come back.
+    clear
+    printf ' \033[1;32mAcreetionOS Recovery\033[0m — %s\n\n' "$1"
+    shift
+    "$@" </dev/tty 2>&1 | tee -a "$LOG"
+    local rc=${PIPESTATUS[0]}
+    printf '\n \033[1;32m>>>\033[0m Finished (exit code %s). Press Enter to continue...' "$rc"
+    read -r </dev/tty
+    return "$rc"
+}
+
+###############################################################################
+# Installed-system detection
+###############################################################################
+
+mount_target() {
+    if [ -n "$TARGET" ] && mountpoint -q "$TARGET"; then return 0; fi
+    TARGET=""; TARGET_SRC=""
+    local candidates=() tmp pretty
+    mkdir -p "$MNT"
+    while read -r path fstype; do
+        case "$fstype" in ext2|ext3|ext4|xfs|btrfs|f2fs) ;; *) continue ;; esac
+        tmp=$(mktemp -d)
+        if mount -o ro,noatime "$path" "$tmp" 2>/dev/null; then
+            if [ -f "$tmp/etc/os-release" ] && [ -d "$tmp/usr/bin" ]; then
+                pretty="Unknown Linux"
+                . "$tmp/etc/os-release" 2>/dev/null && pretty="${PRETTY_NAME:-Unknown Linux}"
+                candidates+=("$path" "$pretty")
+            fi
+            umount "$tmp" 2>/dev/null
+        fi
+        rmdir "$tmp" 2>/dev/null
+    done < <(lsblk -rno PATH,FSTYPE 2>/dev/null | awk '$2!="swap"')
+
+    [ ${#candidates[@]} -eq 0 ] && return 1
+
+    if [ ${#candidates[@]} -eq 2 ]; then
+        TARGET_SRC=${candidates[0]}
+    else
+        local choice
+        choice=$(wt --title " Select System " \
+            --menu "Multiple installed systems were found.\nSelect the one to repair:" 20 76 8 \
+            "${candidates[@]}" 3>&1 1>&2 2>&3) || return 1
+        TARGET_SRC=$choice
+    fi
+
+    if ! mount "$TARGET_SRC" "$MNT" 2>/dev/null; then
+        mount -o rw,relatime "$TARGET_SRC" "$MNT" 2>/dev/null || return 1
+    fi
+    # Mount essential API filesystems for chroot operations.
+    mount --bind /dev      "$MNT/dev"     2>/dev/null
+    mount --bind /proc     "$MNT/proc"    2>/dev/null
+    mount --bind /sys      "$MNT/sys"     2>/dev/null
+    # Honour the target's own /etc/fstab for extra mounts (boot, efi, home...).
+    if grep -qsE '^\S+\s+/(boot|efi|boot/efi)\s+vfat' "$MNT/etc/fstab"; then
+        grep -E '^\S+\s+/(boot|efi|boot/efi)\s+vfat' "$MNT/etc/fstab" |
+        while read -r _spec mp _rest; do
+            [ -d "$MNT$mp" ] || mkdir -p "$MNT$mp"
+            mountpoint -q "$MNT$mp" || mount "$mp" 2>/dev/null || true
+        done
+    fi
+    TARGET="$MNT"
+    msg "Mounted $TARGET_SRC at $TARGET"
+    return 0
+}
+
+ensure_mounted() {
+    mountpoint -q "$MNT" && { TARGET=$MNT; return 0; }
+    confirm " Mount Required " \
+"This action works on an INSTALLED system.\nNo system is currently mounted.\n\nScan disks and select a system now?" 11 64 &&
+        mount_target
+}
+
+chroot_run() {
+    arch-chroot "$TARGET" "$@"
+}
+
+###############################################################################
+# A/B slot management (immutable)
+###############################################################################
+
+# Locate and mount the ESP env of the mounted target system.
+# Sets ESP_MNT and ENV_FILE on success.
+abroot_find_env() {
+    ensure_mounted || return 1
+    local puuid dev
+    puuid=$(sed -n 's/^ESP_PARTUUID=//p' "$TARGET/etc/abroot.conf" | head -n1)
+    if [ -z "$puuid" ]; then
+        info_box " Not Immutable " \
+"This system has no /etc/abroot.conf.\nIt was not installed as AcreetionOS Immutable,\nso A/B slot tools are unavailable." 10 60
+        return 1
+    fi
+    dev="/dev/disk/by-partuuid/$puuid"
+    if [ ! -e "$dev" ]; then
+        err "ESP partition ($puuid) not found"
+        return 1
+    fi
+    ESP_MNT=/mnt/acr-esp
+    mkdir -p "$ESP_MNT"
+    mountpoint -q "$ESP_MNT" || mount "$dev" "$ESP_MNT" || { err "could not mount ESP"; return 1; }
+    [ -f "$ESP_MNT/acr/env" ] || { err "no /acr/env on ESP"; return 1; }
+    ENV_FILE="$ESP_MNT/acr/env"
+    return 0
+}
+
+env_get() { grub-editenv "$ENV_FILE" list 2>/dev/null | sed -n "s/^$1=//p" | head -n1; }
+
+slots_status() {
+    abroot_find_env || return 1
+    local active pending tries msgtxt
+    active=$(env_get active_slot);  active=${active:-A}
+    pending=$(env_get pending_slot)
+    tries=$(env_get tries_left)
+    msgtxt="Committed default slot : ${active}\n"
+    if [ -n "$pending" ]; then
+        msgtxt+="Pending slot          : ${pending} (${tries:-?} tries left)\nThe pending slot will be tried on next boot."
+    else
+        msgtxt+="Pending slot          : none"
+    fi
+    local s
+    for s in A B; do
+        msgtxt+="\nSlot ${s} partition    : $(sed -n "s/^SLOT${s}_PARTUUID=//p" "$TARGET/etc/abroot.conf")"
+    done
+    info_box " A/B Slot Status " "$msgtxt" 14 70
+}
+
+slots_rollback() {
+    abroot_find_env || return 1
+    local active other
+    active=$(env_get active_slot); active=${active:-A}
+    case "$active" in
+        A) other=B ;;
+        B) other=A ;;
+        *) other=A ;;
+    esac
+    confirm " Switch Slot " \
+"Committed default is currently slot ${active}.\nSwitch the default to slot ${other}?\n\nThe change takes effect on the next reboot." 12 62 || return 0
+    grub-editenv "$ENV_FILE" set active_slot="$other"
+    grub-editenv "$ENV_FILE" unset pending_slot
+    grub-editenv "$ENV_FILE" unset tries_left
+    umount "$ESP_MNT" 2>/dev/null || true
+    pause_ok "Slot ${other} is now the default. Reboot to switch."
+}
+
+###############################################################################
+# Repair tools
+###############################################################################
+
+repair_packages() {
+    ensure_mounted || return 1
+    confirm " Repair Packages " \
+"This will, inside the selected system:\n  • re-initialise pacman keyring + refresh keys\n  • synchronise databases and upgrade all packages\n  • attempt to fix broken dependencies\n\nAn internet connection is required. Continue?" 13 70 || return 0
+    run_in_terminal "Repairing packages" bash -c '
+        set -x
+        arch-chroot '"$TARGET"' bash -exc "
+            pacman-key --init
+            pacman-key --populate
+            pacman -Sy --noconfirm archlinux-keyring
+            pacman -Su --noconfirm
+            rm -rf /var/lib/pacman/sync/*
+            pacman -Syyu --noconfirm
+            missing=\$(pacman -Qk 2>/dev/null | grep \"missing\" | cut -d\" \" -f1)
+            [ -n \"\$missing\" ] && pacman -S --noconfirm \$missing
+            exit 0
+        "
+    '
+}
+
+repair_filesystems() {
+    ensure_mounted || return 1
+    local rootdev="$TARGET_SRC"
+    confirm " Filesystem Check " \
+"Unmount the selected system and run fsck -fy on its partitions?\n\nThe system must NOT be in use during the check." 10 66 || return 0
+    unmount_target_silent
+    run_in_terminal "Checking $rootdev" bash -c "fsck -fy $rootdev"
+    pause_ok "Filesystem check finished."
+    confirm " Remount " "Remount the system to continue repairing?" 8 50 && mount_target || true
+}
+
+repair_initramfs_and_grub_quiet() {
+    run_in_terminal "Rebuilding initramfs + GRUB config" bash -c '
+        arch-chroot '"$TARGET"' bash -exc "
+            mkinitcpio -P || dracut -f --regenerate-all || exit \$?
+            grub-mkconfig -o /boot/grub/grub.cfg
+            exit 0
+        "
+    '
+}
+
+repair_bootloader() {
+    ensure_mounted || return 1
+    # Immutable systems must be repaired with their own A/B-aware routine.
+    if [ -f "$TARGET/etc/abroot.conf" ] && [ -x "$TARGET/usr/local/sbin/abroot-install-bootloader.sh" ]; then
+        confirm " Boot Repair (Immutable GRUB) " \
+"This will reinstall GRUB to the ESP and rewrite the A/B\nboot configuration from this system's partition map.\n\nSlot states (active/pending) are preserved." 11 68 || return 0
+        run_in_terminal "Reinstalling GRUB (immutable A/B layout)" \
+            chroot_run /usr/local/sbin/abroot-install-bootloader.sh
+        pause_ok "Boot repair finished."
+        return 0
+    fi
+    confirm " Boot Repair (GRUB) " \
+"This will reinstall GRUB on the selected system:\n  • UEFI: grub-install to the ESP (+ NVRAM entry 'AcreetionOS')\n  • BIOS: grub-install to every disk's MBR\n  • regenerate grub.cfg with os-prober (dual-boot detection)\n\nContinue?" 13 72 || return 0
+    local efi=0
+    [ -d /sys/firmware/efi/efivars ] && efi=1
+    # Ensure os-prober is enabled for dual-boot setups.
+    if [ -f "$TARGET/etc/default/grub" ] && ! grep -q "^GRUB_DISABLE_OS_PROBER=false" "$TARGET/etc/default/grub"; then
+        sed -i "/GRUB_DISABLE_OS_PROBER/d" "$TARGET/etc/default/grub"
+        echo "GRUB_DISABLE_OS_PROBER=false" >> "$TARGET/etc/default/grub"
+    fi
+    local mntpt="" disk cand
+    if [ "$efi" -eq 1 ]; then
+        # Prefer an ESP already mounted inside the target (from its fstab).
+        mntpt=$(findmnt -rno TARGET,FSTYPE "$TARGET" 2>/dev/null |
+                awk -v mnt="$TARGET" '$2=="vfat" && ($1==mnt"/boot/efi"||$1==mnt"/efi"||$1==mnt"/boot"){print $1; exit}')
+        mntpt=${mntpt#"$TARGET"}
+        if [ -z "$mntpt" ]; then
+            # Fall back to the first vfat partition on the target's disk.
+            disk=$(lsblk -rno PKNAME "$TARGET_SRC" 2>/dev/null | head -n1)
+            if [ -n "$disk" ]; then
+                cand=$(lsblk -rno PATH,FSTYPE "/dev/$disk" 2>/dev/null | awk '$2=="vfat"{print $1; exit}')
+            fi
+            if [ -n "$cand" ]; then
+                mkdir -p "$TARGET/boot/efi"
+                if mount "$cand" "$TARGET/boot/efi" 2>/dev/null; then
+                    mntpt=/boot/efi
+                    msg "Mounted ESP $cand at $TARGET/boot/efi"
+                fi
+            fi
+        fi
+        if [ -z "$mntpt" ]; then
+            info_box " No ESP Found " "Could not find an EFI System Partition.\nCreate/mount one under /boot/efi in the target and retry." 10 62
+            return 1
+        fi
+        run_in_terminal "Reinstalling GRUB (UEFI, ESP: $mntpt)" bash -c "
+            arch-chroot $TARGET bash -exc '
+                mkdir -p $mntpt
+                grub-install --target=x86_64-efi --efi-directory=$mntpt --bootloader-id=AcreetionOS --recheck
+                grub-install --target=i386-efi --efi-directory=$mntpt --bootloader-id=AcreetionOS --recheck || true
+                grub-mkconfig -o /boot/grub/grub.cfg
+                exit 0
+            '"
+    else
+        local disks=()
+        while read -r d; do disks+=("$d"); done < <(lsblk -rno PATH,TYPE 2>/dev/null | awk '$2=="disk"{print $1}')
+        run_in_terminal "Reinstalling GRUB (BIOS → ${disks[*]})" bash -c "
+            for d in ${disks[*]@Q}; do
+                arch-chroot $TARGET grub-install --target=i386-pc --recheck \$d || exit 1
+            done && arch-chroot $TARGET grub-mkconfig -o /boot/grub/grub.cfg"
+    fi
+    pause_ok "Boot repair finished."
+}
+
+reset_password() {
+    ensure_mounted || return 1
+    local users=() u uid gecos
+    while read -r u uid gecos; do
+        [ "$uid" -ge 1000 ] || [ "$u" = root ] || continue
+        users+=("$u" "${gecos%%,*}")
+    done < <(awk -F: '$3>=1000||$1=="root"{print $1":"$3":"$5}' "$TARGET/etc/passwd" | tr ':' ' ')
+    [ ${#users[@]} -eq 0 ] && { info_box " No Users " "No user accounts found." 8 40; return 1; }
+    users+=("_cancel" "Cancel")
+    local sel
+    sel=$(wt --title " Reset Password " --menu "Select the account:" 18 60 7 "${users[@]}" 3>&1 1>&2 2>&3) || return 0
+    [ "$sel" = "_cancel" ] && return 0
+    clear
+    printf ' \033[1;32mResetting password for "%s"\033[0m\n\n' "$sel"
+    chroot_run passwd "$sel" </dev/tty
+    printf '\n Press Enter to continue...'; read -r </dev/tty
+}
+
+network_setup() {
+    if command -v nmtui >/dev/null; then
+        nmtui </dev/tty >/dev/tty 2>&1 || true
+    else
+        info_box " Network " "NetworkManager TUI (nmtui) is unavailable." 8 46
+    fi
+}
+
+hw_info() {
+    clear
+    if command -v inxi >/dev/null; then
+        inxi -Fxxxz </dev/null 2>&1 | less
+    elif command -v fastfetch >/dev/null; then
+        fastfetch </dev/null 2>&1 | less
+    else
+        lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL | less
+    fi
+}
+
+view_logs() {
+    clear
+    if [ -n "$TARGET" ] && [ -d "$TARGET/var/log/journal" ]; then
+        journalctl --directory="$TARGET/var/log/journal" -p warning..alert --no-pager 2>&1 | less
+    else
+        journalctl -p warning..alert --no-pager -b 2>&1 | less
+    fi
+}
+
+chroot_shell() {
+    ensure_mounted || return 0
+    clear
+    printf ' \033[1;32mChroot shell\033[0m — you are INSIDE the installed system (%s).\n Type \033[1mexit\033[0m to return to the recovery menu.\n\n' "$TARGET"
+    ENV=/etc/profile PS1='[\e[1;32mchroot\e[0m:\w]\$ ' chroot_run env TERM="${TERM:-linux}" HOME=/root bash -i </dev/tty 2>&1
+    show_banner
+}
+
+root_shell() {
+    clear
+    printf ' \033[1;32mLive recovery shell\033[0m — running from the ISO.\n Type \033[1mexit\033[0m to return to the recovery menu.\n\n'
+    PS1='[\e[1;32mrecovery\e[0m:\w]\$ ' bash -i </dev/tty 2>&1
+    show_banner
+}
+
+unmount_target_silent() {
+    [ -n "$TARGET" ] || return 0
+    sync
+    for sub in dev/pts dev/shm dev proc sys boot/efi boot efi; do
+        mountpoint -q "$TARGET/$sub" && umount -R "$TARGET/$sub" 2>/dev/null
+    done
+    umount -R "$TARGET" 2>/dev/null
+    TARGET=""
+}
+
+###############################################################################
+# Main menu
+###############################################################################
+
+main_menu() {
+    while :; do
+        local action
+        action=$(wt --title " Main Menu " --menu \
+"Select a recovery action:
+
+${TARGET:+System mounted: $TARGET ($TARGET_SRC)}${TARGET:-No system currently mounted.}
+Most actions need a mounted system; you will be asked to pick one." 24 78 14 \
+"slots-status" "Show A/B slot status (immutable)" \
+"slots-switch" "Switch default A/B slot (rollback)" \
+"packages"   "Repair packages (pacman keyring, upgrade, deps)" \
+"fsck"       "Check & repair filesystems (fsck)" \
+"grub"       "Reinstall bootloader / repair GRUB" \
+"password"   "Reset a user password" \
+"network"    "Configure network connection" \
+"hw"         "Hardware information" \
+"logs"       "View system logs" \
+"shell-chroot"  "Open shell INSIDE the installed system" \
+"shell-live"    "Open live recovery shell" \
+"exit"       "Exit / reboot" 3>&1 1>&2 2>&3) || action="exit"
+
+        case "$action" in
+            slots-status) slots_status ;;
+            slots-switch) slots_rollback ;;
+            packages)    repair_packages ;;
+            fsck)        repair_filesystems ;;
+            grub)        repair_bootloader ;;
+            password)    reset_password ;;
+            network)     network_setup ;;
+            hw)          hw_info ;;
+            logs)        view_logs ;;
+            shell-chroot) chroot_shell ;;
+            shell-live)  root_shell ;;
+            exit)
+                unmount_target_silent
+                local out
+                out=$(wt --title " Exit Recovery " --menu "What next?" 12 52 4 \
+                    reboot "Restart the computer" \
+                    shutdown "Power off the computer" \
+                    shell "Drop to a shell instead" 3>&1 1>&2 2>&3)
+                case "$out" in
+                    reboot)   sync; systemctl reboot -i ;;
+                    shutdown) sync; systemctl poweroff -i ;;
+                    *)        break ;;
+                esac
+                ;;
+        esac
+    done
+}
+
+main() {
+    require_root
+    apply_console_theme
+    : >"$LOG"
+    chmod 600 "$LOG" 2>/dev/null
+    show_banner
+    # Give slow storage/network devices a moment to appear.
+    sleep 1
+    main_menu
+    clear
+    exit 0
+}
+
+main "$@"

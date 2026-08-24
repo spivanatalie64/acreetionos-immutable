@@ -1,0 +1,15 @@
+NAME="AcreetionOS Immutable"
+PRETTY_NAME="AcreetionOS Immutable 1.0"
+ID=acreetionos-immutable
+ID_LIKE=arch acreetionos
+VERSION_ID=1.0
+BUILD_ID=atomic-rolling
+VARIANT="Immutable"
+VARIANT_ID=immutable
+ANSI_COLOR="38;2;23;147;209"
+HOME_URL="https://acreetionos.org/"
+DOCUMENTATION_URL="https://wiki.acreetionos.org/"
+SUPPORT_URL="https://discord.acreetionos.org/"
+BUG_REPORT_URL="https://gitlab.acreetionos.org/acreetionos-code/acreetionos-immutable.git"
+PRIVACY_POLICY_URL="https://terms.acreetionos.org"
+LOGO=acreetionos-logo

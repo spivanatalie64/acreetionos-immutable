@@ -1,0 +1,46 @@
+#!/bin/sh
+# Runtime portion of the 'abroot' mkinitcpio hook.
+# Runs after the 'filesystems' hook has mounted the real root at $newroot.
+# shellcheck shell=dash disable=SC3043,SC2154  # runs under busybox ash; $newroot provided by mkinitcpio
+
+abroot_mount_data() {
+	local conf_uuid real
+	conf_uuid=$(sed -n 's/^DATA_PARTUUID=//p' "${1}/etc/abroot.conf" 2>/dev/null | head -n1)
+	[ -n "$conf_uuid" ] || return 1
+	real="/dev/disk/by-partuuid/$conf_uuid"
+	[ -e "$real" ] || return 1
+	mount -t ext4 -o rw "$real" "${1}/mnt/.data"
+}
+
+run_hook() {
+	local slot upper work mnt="${newroot}"
+
+	slot=$(tr ' ' '\n' < /proc/cmdline \
+		| sed -n 's/^abroot\.slot=\([AB]\)$/\1/p' | head -n1)
+	[ -n "$slot" ] || slot="A"
+
+	mkdir -p "${mnt}/mnt/.data"
+
+	if abroot_mount_data "$mnt"; then
+		upper="${mnt}/mnt/.data/abroot/etc-${slot}/upper"
+		work="${mnt}/mnt/.data/abroot/etc-${slot}/work"
+		mkdir -p "$upper" "$work"
+		msg "abroot: mounting persistent /etc overlay for slot ${slot}"
+	else
+		warn "abroot: data partition unavailable - using temporary /etc overlay"
+		tmp="${mnt}/.etc-abroot-tmp"
+		mkdir -p "${tmp}"
+		mount -t tmpfs -o mode=0755 tmpfs "${tmp}" || { warn "abroot: /etc stays read-only this boot"; return 0; }
+		upper="${tmp}/upper"
+		work="${tmp}/work"
+		mkdir -p "$upper" "$work"
+	fi
+
+	if ! mount -t overlay overlay \
+		-o "lowerdir=${mnt}/etc,upperdir=${upper},workdir=${work}" \
+		"${mnt}/etc"; then
+		warn "abroot: failed to mount /etc overlay - continuing with read-only /etc"
+	fi
+}
+
+# vim: set ft=sh ts=4 sw=4 et:

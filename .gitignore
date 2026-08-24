@@ -1,0 +1,18 @@
+# Build directories
+work/
+out/
+../ISO/*.iso
+
+# Generated per-build stamp (see generate-build-info.sh)
+airootfs/etc/acreetion-build
+
+# Compiled binaries
+mkarchiso_wrapper
+*.o
+
+# Backup files
+*.bak
+*.save
+
+# Pacman cache
+/var/cache/pacman/pkg/*

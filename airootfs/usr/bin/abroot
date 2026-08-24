@@ -1,0 +1,312 @@
+#!/bin/bash
+# abroot - AcreetionOS Immutable A/B root management tool
+#
+# Slot layout (GPT, created by the Calamares "erase disk" flow):
+#   ACR-EFI     FAT32   /efi            GRUB + abroot environment file
+#   ACR-SLOT-A  ext4    /               committed root slot A  (mounted ro)
+#   ACR-SLOT-B  ext4    /               standby root slot B    (mounted ro)
+#   data        ext4    /mnt/.data      shared: /home, /var, per-slot /etc overlays
+#
+# State lives in the GRUB environment file /efi/acr/env:
+#   active_slot=A|B    slot to boot by default
+#   pending_slot=A|B   slot staged by 'abroot update', booted on next reboot
+#   tries_left=N       boot attempts left for pending slot before auto-fallback
+
+set -euo pipefail
+
+VERSION="1.0"
+
+CONF_FILE="/etc/abroot.conf"
+ENV_FILE="/efi/acr/env"
+DATA_MNT="/mnt/.data"
+STAGE_MNT="/mnt/abroot-slot"
+TRIES_DEFAULT=3
+
+C_G="\033[1;32m"; C_Y="\033[1;33m"; C_R="\033[1;31m"; C_B="\033[1;36m"; C_0="\033[0m"
+
+msg()  { printf "${C_G}==>${C_0} %s\n" "$*"; }
+warn() { printf "${C_Y}==> WARNING:${C_0} %s\n" "$*"; }
+die()  { printf "${C_R}==> ERROR:${C_0} %s\n" "$*" >&2; exit 1; }
+
+usage() {
+	cat <<EOF
+abroot ${VERSION} - AcreetionOS Immutable A/B root manager
+
+Usage:
+  abroot status              Show active/pending slots and update state
+  abroot update              Stage a full system update into the inactive slot
+  abroot rollback            Reboot into the last known-good slot
+  abroot unlock              Temporarily remount / read-write (until next boot)
+  abroot lock                Remount / read-only again
+  abroot kargs               Show kernel command line of this boot
+
+Environment:
+  ABROOT_ASSUME_YES=1       Answer yes to all prompts
+EOF
+}
+
+need_root() {
+	[[ ${EUID} -eq 0 ]] || die "abroot must run as root (try: sudo abroot $1)"
+}
+
+confirm() {
+	[[ ${ABROOT_ASSUME_YES:-0} -eq 1 ]] && return 0
+	local reply
+	read -r -p "$1 [y/N] " reply </dev/tty || return 1
+	[[ ${reply,,} == y || ${reply,,} == yes ]]
+}
+
+env_get() {
+	# env_get <key> [default]
+	local key="$1" def="${2:-}"
+	local val=""
+	if [[ -r ${ENV_FILE} ]]; then
+		val=$(grub-editenv "${ENV_FILE}" list 2>/dev/null | sed -n "s/^${key}=//p" | head -n1)
+	fi
+	printf '%s' "${val:-${def}}"
+}
+
+env_set() { grub-editenv "${ENV_FILE}" set "$1=$2" >/dev/null; }
+
+env_unset() { grub-editenv "${ENV_FILE}" unset "$1" >/dev/null; }
+
+current_slot() {
+	local slot=""
+	if [[ -r /proc/cmdline ]]; then
+		slot=$(sed -n 's/.*[[:space:]]abroot\.slot=\([AB]\).*/\1/p' /proc/cmdline)
+	fi
+	printf '%s' "${slot:-A}"
+}
+
+other_slot() {
+	case "$(current_slot)" in
+	A) printf 'B' ;;
+	B) printf 'A' ;;
+	*) die "cannot determine current slot" ;;
+	esac
+}
+
+conf_get() {
+	sed -n "s/^$1=//p" "${CONF_FILE}" 2>/dev/null | head -n1
+}
+
+slot_partuuid() {
+	# slot_partuuid <A|B>
+	case "$1" in
+	A) conf_get SLOTA_PARTUUID ;;
+	B) conf_get SLOTB_PARTUUID ;;
+	esac
+}
+
+slot_dev() {
+	local uuid
+	uuid=$(slot_partuuid "$1")
+	[[ -n ${uuid} ]] || die "${CONF_FILE} is missing $1 partuuid (installed system only)"
+	findfs "PARTUUID=${uuid}"
+}
+
+mount_data() {
+	mkdir -p "${DATA_MNT}"
+	mountpoint -q "${DATA_MNT}" && return 0
+	local uuid
+	uuid=$(conf_get DATA_PARTUUID)
+	[[ -n ${uuid} ]] || die "${CONF_FILE} is missing DATA_PARTUUID"
+	findfs "PARTUUID=${uuid}" >/dev/null || die "data partition not found"
+	mount "PARTUUID=${uuid}" "${DATA_MNT}" || die "failed to mount data partition"
+}
+
+require_env_file() {
+	mountpoint -q /efi || die "ESP is not mounted at /efi"
+	[[ -f ${ENV_FILE} ]] || die "environment file ${ENV_FILE} not found"
+	command -v grub-editenv >/dev/null || die "grub-install package (grub-editenv) is required"
+}
+
+mount_inactive() {
+	local slot="$1" dev
+	dev=$(slot_dev "${slot}")
+	mkdir -p "${STAGE_MNT}"
+	if mountpoint -q "${STAGE_MNT}"; then
+		die "${STAGE_MNT} is already mounted - clean up before continuing"
+	fi
+	mount -o rw "${dev}" "${STAGE_MNT}" || die "failed to mount slot ${slot}"
+}
+
+umount_inactive() {
+	sync
+	umount -R "${STAGE_MNT}" 2>/dev/null || umount "${STAGE_MNT}" 2>/dev/null || warn "could not unmount ${STAGE_MNT}"
+}
+
+cmd_status() {
+	local cur other active pending tries
+	cur=$(current_slot)
+	other=$(other_slot)
+	active=$(env_get active_slot "${cur}")
+	pending=$(env_get pending_slot "")
+	tries=$(env_get tries_left "-")
+
+	printf '%b\n' "${C_B}AcreetionOS Immutable${C_0} - abroot ${VERSION}"
+	echo "  config          : ${CONF_FILE}"
+	echo "  env file        : ${ENV_FILE}"
+	echo "  current boot    : slot ${cur}"
+	echo "  active (default): slot ${active}"
+	if [[ -n ${pending} ]]; then
+		echo "  pending         : slot ${pending} (${tries} tries left before fallback)"
+	else
+		echo "  pending         : none"
+	fi
+
+	for s in A B; do
+		local puuid mark
+		puuid=$(slot_partuuid "${s}" || true)
+		mark="missing"
+		[[ -e "${DATA_MNT}/abroot/state/${s}.ok" ]] && mark="present"
+		printf '  slot %s           : PARTUUID=%s  state-marker=%s%s\n' \
+			"${s}" "${puuid:-?}" "${mark}" "$([[ ${s} == "${cur}" ]] && printf '  <-- running')"
+	done
+
+	if [[ -f /var/lib/abroot/last-update ]]; then
+		echo "  last update     : $(cat /var/lib/abroot/last-update)"
+	fi
+	local pacnew
+	pacnew=$(find /etc -name '*.pacnew' 2>/dev/null | wc -l)
+	[[ ${pacnew} -gt 0 ]] && warn "${pacnew} .pacnew file(s) in /etc - review with 'pacdiff' after next update"
+}
+
+cmd_update() {
+	need_root update
+	require_env_file
+	mount_data
+
+	local cur other pending
+	cur=$(current_slot)
+	other=$(other_slot)
+	pending=$(env_get pending_slot "")
+	[[ -z ${pending} ]] || die "a pending slot (${pending}) already exists - reboot into it first or run 'abroot rollback'"
+	[[ ${cur} == "$(env_get active_slot "${cur}")" ]] || warn "currently booted slot ${cur} is NOT the committed default - updating anyway"
+
+	msg "Preparing inactive slot ${other}..."
+	mount_inactive "${other}"
+
+	# Clone active -> inactive if the standby slot has no OS yet.
+	if [[ ! -x ${STAGE_MNT}/usr/bin ]]; then
+		msg "Standby slot ${other} is empty - cloning running system (this may take a few minutes)..."
+		rsync -aHAXS --numeric-ids --one-file-system \
+			--exclude='/dev/*' --exclude='/proc/*' --exclude='/sys/*' \
+			--exclude='/run/*' --exclude='/tmp/*' \
+			--exclude='/mnt/*' --exclude='/media/*' \
+			--exclude='/efi/*' --exclude='/lost+found' \
+			--exclude='/swapfile' --exclude='/var/lib/abroot' \
+			/ "${STAGE_MNT}/" || {
+				umount_inactive
+				die "clone failed - standby slot left incomplete (no marker written)"
+			}
+		# Each slot needs its own machine identity.
+		rm -f "${STAGE_MNT}/etc/machine-id" "${STAGE_MNT}/var/lib/dbus/machine-id"
+		systemd-machine-id-setup --root="${STAGE_MNT}" >/dev/null
+		mkdir -p "${STAGE_MNT}/var/lib/dbus"
+		cp "${STAGE_MNT}/etc/machine-id" "${STAGE_MNT}/var/lib/dbus/machine-id"
+	fi
+
+	msg "Updating packages in slot ${other}..."
+	mkdir -p "${STAGE_MNT}/run" "${STAGE_MNT}/etc"
+	cp -L /etc/resolv.conf "${STAGE_MNT}/etc/resolv.conf" 2>/dev/null || true
+	if ! arch-chroot "${STAGE_MNT}" /bin/bash -c \
+		"export HOME=/root; pacman -Syu --noconfirm" ; then
+		warn "package update failed - slot ${other} NOT marked ready"
+		warn "it will not be offered as a rollback target until an update succeeds"
+		umount_inactive
+		exit 1
+	fi
+
+	# Make sure the initramfs matches whatever kernel just landed.
+	arch-chroot "${STAGE_MNT}" /bin/bash -c "export HOME=/root; mkinitcpio -P" || warn "mkinitcpio failed in slot ${other}"
+
+	msg "Marking slot ${other} as ready..."
+	mkdir -p "${DATA_MNT}/abroot/state"
+	date -Is >"${DATA_MNT}/abroot/state/${other}.ok"
+	mkdir -p "${STAGE_MNT}/var/lib/abroot"
+	date -Is >"${STAGE_MNT}/var/lib/abroot/last-update"
+
+	msg "Arming boot switch: next reboot starts slot ${other} (${TRIES_DEFAULT} attempts allowed)..."
+	env_set pending_slot "${other}"
+	env_set tries_left "${TRIES_DEFAULT}"
+	umount_inactive
+
+	msg "Done. Reboot to activate the updated slot."
+	msg "If slot ${other} fails to boot ${TRIES_DEFAULT} times, the previous slot boots automatically."
+	msg "After a successful boot the new slot becomes the default automatically."
+}
+
+cmd_rollback() {
+	need_root rollback
+	require_env_file
+	mount_data
+
+	local other
+	other=$(other_slot)
+	slot_dev "${other}" >/dev/null 2>&1 || die "slot ${other} partition not found"
+	if [[ ! -s "${DATA_MNT}/abroot/state/${other}.ok" ]]; then
+		die "slot ${other} has never held a successful update - nothing to roll back to"
+	fi
+
+	confirm "Set slot ${other} as the default and reboot into it?" || die "aborted"
+	env_set active_slot "${other}"
+	env_unset pending_slot
+	env_unset tries_left
+	msg "Slot ${other} is now the default. Reboot to switch."
+}
+
+cmd_commit() {
+	# Internal: called by abroot-commit.service shortly after boot.
+	local cur pending
+	cur=$(current_slot)
+	pending=$(env_get pending_slot "")
+	[[ ${pending} == "${cur}" ]] || exit 0
+
+	require_env_file || exit 1
+	logger -t abroot "booted pending slot ${cur}, settling 20s before commit"
+	sleep 20
+
+	# Basic health: root mounted ro, /etc writable via overlay, /var writable.
+	mountpoint -q /mnt/.data || { logger -t abroot "health check failed: /mnt/.data not mounted"; exit 1; }
+	touch /mnt/.data/abroot/.commit-probe 2>/dev/null || {
+		logger -t abroot "health check failed: /var data store not writable"
+		exit 1
+	}
+
+	env_set active_slot "${cur}"
+	env_unset pending_slot
+	env_unset tries_left
+	logger -t abroot "slot ${cur} committed as new default"
+}
+
+cmd_unlock() {
+	need_root unlock
+	warn "This remounts / read-write. The system stays mutable until the NEXT reboot."
+	warn "Changes made now are lost when an update overwrites this slot."
+	confirm "Continue?" || die "aborted"
+	mount -o remount,rw / || die "remount failed"
+	msg "/ is now read-write (temporary - back to read-only after reboot)."
+}
+
+cmd_lock() {
+	need_root lock
+	mount -o remount,ro / || die "remount failed"
+	msg "/ is read-only again."
+}
+
+cmd_kargs() {
+	cat /proc/cmdline
+}
+
+case "${1:-}" in
+	status) shift; cmd_status "$@" ;;
+	update) shift; cmd_update "$@" ;;
+	rollback) shift; cmd_rollback "$@" ;;
+	unlock) shift; cmd_unlock "$@" ;;
+	lock) shift; cmd_lock "$@" ;;
+	kargs) shift; cmd_kargs "$@" ;;
+	commit) shift; cmd_commit "$@" ;; # internal use by systemd unit
+	-h | --help | help | "") usage ;;
+	*) usage; die "unknown command: $1" ;;
+esac
