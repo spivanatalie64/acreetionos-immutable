@@ -103,7 +103,9 @@ publish:iso:
     - mv "${ISO_FILE}" "${PUBLISH_DIR}/${PUBLISHED_NAME}"
     - mv "${PUBLISH_DIR}/.staging/SHA256SUMS" "${PUBLISH_DIR}/SHA256SUMS"
     - mv "${PUBLISH_DIR}/.staging/MD5SUMS" "${PUBLISH_DIR}/MD5SUMS"
-    - ln -sf "${PUBLISH_DIR}/${PUBLISHED_NAME}" "${PUBLISH_DIR}/AcreetionOS-Immutable-latest.iso"
+    # Relative symlink so it resolves both in-job (/srv/http/iso) and on
+    # the host web root (/drive1)
+    - ln -sf "${PUBLISHED_NAME}" "${PUBLISH_DIR}/AcreetionOS-Immutable-latest.iso"
     - rm -rf "${PUBLISH_DIR}/.staging"
     # Prune only dated development builds; tagged release ISOs are kept
     - ls -t "${PUBLISH_DIR}"/AcreetionOS-Immutable-2*.iso 2>/dev/null | tail -n +4 | xargs -r rm -v
