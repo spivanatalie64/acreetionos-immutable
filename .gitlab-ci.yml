@@ -70,10 +70,11 @@ build:iso:
     - cat SHA256SUMS
     # Docker executor: out/ does not survive into the publish job, so hand
     # over via the shared /drive1 mount (host path /srv/http/iso).
+    # Per-pipeline subdir avoids races between concurrent builds.
     - echo "==> Handing artifacts to the publish stage..."
-    - mkdir -p "${PUBLISH_DIR}/.staging"
-    - cp -f "${ISO_OUT_DIR}"/*.iso "${PUBLISH_DIR}/.staging/"
-    - cp -f SHA256SUMS MD5SUMS "${PUBLISH_DIR}/.staging/"
+    - mkdir -p "${PUBLISH_DIR}/.staging/${CI_PIPELINE_ID}"
+    - cp -f "${ISO_OUT_DIR}"/*.iso "${PUBLISH_DIR}/.staging/${CI_PIPELINE_ID}/"
+    - cp -f SHA256SUMS MD5SUMS "${PUBLISH_DIR}/.staging/${CI_PIPELINE_ID}/"
   after_script:
     - rm -rf "${WORK_DIR}"
 
@@ -89,8 +90,9 @@ publish:iso:
   needs:
     - build:iso
   script:
-    # build:iso left the artifacts in the shared staging dir (host: /drive1/.staging)
-    - ISO_FILE=$(ls "${PUBLISH_DIR}"/.staging/*.iso | head -n1)
+    # build:iso left the artifacts in this pipeline's staging dir
+    - STAGE_DIR="${PUBLISH_DIR}/.staging/${CI_PIPELINE_ID}"
+    - ISO_FILE=$(ls "${STAGE_DIR}"/*.iso | head -n1)
     - ISO_NAME=$(basename "${ISO_FILE}")
     - |
       if [ -n "${CI_COMMIT_TAG}" ]; then
@@ -101,12 +103,14 @@ publish:iso:
       fi
     - echo "==> Publishing ${ISO_NAME} as ${PUBLISHED_NAME}"
     - mv "${ISO_FILE}" "${PUBLISH_DIR}/${PUBLISHED_NAME}"
-    - mv "${PUBLISH_DIR}/.staging/SHA256SUMS" "${PUBLISH_DIR}/SHA256SUMS"
-    - mv "${PUBLISH_DIR}/.staging/MD5SUMS" "${PUBLISH_DIR}/MD5SUMS"
+    - mv "${STAGE_DIR}/SHA256SUMS" "${PUBLISH_DIR}/SHA256SUMS"
+    - mv "${STAGE_DIR}/MD5SUMS" "${PUBLISH_DIR}/MD5SUMS"
     # Relative symlink so it resolves both in-job (/srv/http/iso) and on
     # the host web root (/drive1)
     - ln -sf "${PUBLISHED_NAME}" "${PUBLISH_DIR}/AcreetionOS-Immutable-latest.iso"
-    - rm -rf "${PUBLISH_DIR}/.staging"
+    - rm -rf "${STAGE_DIR}"
+    # Prune staging leftovers from pipelines that died before publishing
+    - find "${PUBLISH_DIR}/.staging" -mindepth 1 -maxdepth 1 -type d -mtime +1 -exec rm -rf {} + 2>/dev/null || true
     # Prune only dated development builds; tagged release ISOs are kept
     - ls -t "${PUBLISH_DIR}"/AcreetionOS-Immutable-2*.iso 2>/dev/null | tail -n +4 | xargs -r rm -v
     - echo "==> Done. AcreetionOS-Immutable-latest.iso -> ${PUBLISHED_NAME}"
