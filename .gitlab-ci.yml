@@ -1,23 +1,16 @@
 # ═══════════════════════════════════════════════════════════════════
 #  AcreetionOS Immutable ISO Build Pipeline
-#  Branch: acreetionos
-#  Builder: self-hosted shell runner on Dell Precision 7910
+#  Builder: docker-executor runner "acreetion-us-server" on the GitLab host
 #
-#  RUNNER SETUP (run once on the build server):
-#    gitlab-runner register \
-#      --url https://gitlab.acreetionos.org \
-#      --token <YOUR_RUNNER_TOKEN> \
-#      --executor shell \
-#      --description "acreetionos-builder" \
-#      --tag-list "acreetionos" \
-#      --run-untagged false
-#
-#  The runner user needs passwordless sudo (or run as root).
-#  mkarchiso requires loop device access for squashfs builds.
+#  RUNNER SETUP (already done on us.iso.acreetionos.org):
+#    - gitlab-runner (systemd service) with docker executor,
+#      privileged = true (mkarchiso needs loop devices)
+#    - docker host socket: unix:///run/docker.sock.real
+#      (bypasses docker-socket-guard, which breaks keep-alive clients)
+#    - volume "/drive1:/srv/http/iso" so published ISOs hit the web root
 # ═══════════════════════════════════════════════════════════════════
 
 stages:
-  - prepare
   - build
   - publish
   - release
@@ -38,32 +31,13 @@ workflow:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
 
 # ───────────────────────────────────────────────────────────────────
-# STAGE 1 – PREPARE
-# Refresh keyring and ensure archiso + build deps are installed
-# ───────────────────────────────────────────────────────────────────
-prepare:deps:
-  stage: prepare
-  tags:
-    - acreetionos
-  script:
-    - echo "==> Initialising pacman keyring..."
-    - pacman-key --init
-    - pacman-key --populate archlinux
-    - echo "==> Refreshing databases and upgrading keyring..."
-    - pacman -Sy --noconfirm --config "${CI_PROJECT_DIR}/pacman.conf" archlinux-keyring
-    - echo "==> Installing archiso build dependencies..."
-    - pacman -S --noconfirm --needed --config "${CI_PROJECT_DIR}/pacman.conf" archiso squashfs-tools dosfstools erofs-utils mtools xorriso libarchive grub edk2-shell
-    - echo "==> Build environment ready."
-    - mkarchiso --version
-  rules:
-    - when: always
-
-# ───────────────────────────────────────────────────────────────────
-# STAGE 2 – BUILD ISO
+# STAGE 1 – BUILD ISO
+# Docker executor: each job starts from a fresh container, so the
+# keyring init + archiso install happen here (nothing persists across
+# jobs). mkarchiso needs loop devices -> runner runs privileged.
 # pacman.conf defines:
-#   [acreetionOSREPO-main]  iso.acreetionos.org:8448/repo-main/$arch
-#   [personal]              iso.acreetionos.org:8448/personal
-#   [temp-repo]             iso.acreetionos.org:8448/temp_repo/
+#   [acreetionOSREPO-main]  iso.acreetionos.org/repo-main/$arch
+#   [personal]              iso.acreetionos.org/personal
 #   IgnorePkg = v4l2loopback-dkms
 #   ParallelDownloads = 25
 # ───────────────────────────────────────────────────────────────────
@@ -71,13 +45,18 @@ build:iso:
   stage: build
   tags:
     - acreetionos
-  needs:
-    - prepare:deps
   timeout: 3h
   before_script:
+    - echo "==> Initialising pacman keyring..."
+    - pacman-key --init
+    - pacman-key --populate archlinux
+    - echo "==> Refreshing databases and upgrading keyring..."
+    - pacman -Sy --noconfirm --config "${CI_PROJECT_DIR}/pacman.conf" archlinux-keyring
+    - echo "==> Installing archiso build dependencies..."
+    - pacman -S --noconfirm --needed --config "${CI_PROJECT_DIR}/pacman.conf" archiso squashfs-tools dosfstools erofs-utils mtools xorriso libarchive grub edk2-shell
     - echo "==> Cleaning previous build artifacts..."
     - rm -rf "${WORK_DIR}" "${ISO_OUT_DIR}"
-    - mkdir -p "${ISO_OUT_DIR}"
+    - mkdir -p "${ISO_OUT_DIR}" /srv/http/iso
   script:
     - echo "==> Starting AcreetionOS ISO build..."
     - echo "    Commit  ${CI_COMMIT_SHORT_SHA}  Branch  ${CI_COMMIT_BRANCH:-tag:$CI_COMMIT_TAG}  Runner  ${CI_RUNNER_DESCRIPTION}"
@@ -89,15 +68,14 @@ build:iso:
     - sha256sum *.iso > SHA256SUMS
     - md5sum *.iso > MD5SUMS
     - cat SHA256SUMS
+    # Docker executor: out/ does not survive into the publish job, so hand
+    # over via the shared /drive1 mount (host path /srv/http/iso).
+    - echo "==> Handing artifacts to the publish stage..."
+    - mkdir -p "${PUBLISH_DIR}/.staging"
+    - cp -f "${ISO_OUT_DIR}"/*.iso "${PUBLISH_DIR}/.staging/"
+    - cp -f SHA256SUMS MD5SUMS "${PUBLISH_DIR}/.staging/"
   after_script:
     - rm -rf "${WORK_DIR}"
-  artifacts:
-    name: "AcreetionOS-Immutable-${CI_COMMIT_SHORT_SHA}"
-    paths:
-      - out/*.iso
-      - out/SHA256SUMS
-      - out/MD5SUMS
-    expire_in: 30 days
 
 # ───────────────────────────────────────────────────────────────────
 # STAGE 3 – PUBLISH
@@ -111,7 +89,8 @@ publish:iso:
   needs:
     - build:iso
   script:
-    - ISO_FILE=$(ls "${ISO_OUT_DIR}"/*.iso | head -n1)
+    # build:iso left the artifacts in the shared staging dir (host: /drive1/.staging)
+    - ISO_FILE=$(ls "${PUBLISH_DIR}"/.staging/*.iso | head -n1)
     - ISO_NAME=$(basename "${ISO_FILE}")
     - |
       if [ -n "${CI_COMMIT_TAG}" ]; then
@@ -121,11 +100,11 @@ publish:iso:
         PUBLISHED_NAME="AcreetionOS-Immutable-$(date +%Y%m%d)-${CI_COMMIT_SHORT_SHA}.iso"
       fi
     - echo "==> Publishing ${ISO_NAME} as ${PUBLISHED_NAME}"
-    - mkdir -p "${PUBLISH_DIR}"
-    - cp "${ISO_FILE}" "${PUBLISH_DIR}/${PUBLISHED_NAME}"
-    - sha256sum "${PUBLISH_DIR}/${PUBLISHED_NAME}" > "${PUBLISH_DIR}/SHA256SUMS"
-    - md5sum "${PUBLISH_DIR}/${PUBLISHED_NAME}" > "${PUBLISH_DIR}/MD5SUMS"
+    - mv "${ISO_FILE}" "${PUBLISH_DIR}/${PUBLISHED_NAME}"
+    - mv "${PUBLISH_DIR}/.staging/SHA256SUMS" "${PUBLISH_DIR}/SHA256SUMS"
+    - mv "${PUBLISH_DIR}/.staging/MD5SUMS" "${PUBLISH_DIR}/MD5SUMS"
     - ln -sf "${PUBLISH_DIR}/${PUBLISHED_NAME}" "${PUBLISH_DIR}/AcreetionOS-Immutable-latest.iso"
+    - rm -rf "${PUBLISH_DIR}/.staging"
     # Prune only dated development builds; tagged release ISOs are kept
     - ls -t "${PUBLISH_DIR}"/AcreetionOS-Immutable-2*.iso 2>/dev/null | tail -n +4 | xargs -r rm -v
     - echo "==> Done. AcreetionOS-Immutable-latest.iso -> ${PUBLISHED_NAME}"
