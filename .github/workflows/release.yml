@@ -37,5 +37,6 @@ jobs:
             echo "Verify with \`sha256sum -c SHA256SUMS\`."
           } > NOTES.md
           gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
             --title "AcreetionOS Immutable ${VERSION}" \
             --notes-file NOTES.md
