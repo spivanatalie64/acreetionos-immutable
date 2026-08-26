@@ -23,16 +23,19 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          {
+            echo "AcreetionOS Immutable ${VERSION}"
+            echo ""
+            echo "Atomic dual-root (A/B) edition. Read-only root slots with staged,"
+            echo "automatically-committed updates and boot-time rollback."
+            echo ""
+            echo "## Download"
+            echo "- [AcreetionOS-Immutable-${VERSION}.iso](https://iso.acreetionos.org/AcreetionOS-Immutable-${VERSION}.iso)"
+            echo "- [SHA256SUMS](https://iso.acreetionos.org/SHA256SUMS)"
+            echo "- [MD5SUMS](https://iso.acreetionos.org/MD5SUMS)"
+            echo ""
+            echo "Verify with \`sha256sum -c SHA256SUMS\`."
+          } > NOTES.md
           gh release create "${GITHUB_REF_NAME}" \
             --title "AcreetionOS Immutable ${VERSION}" \
-            --notes "AcreetionOS Immutable ${VERSION}
-
-Atomic dual-root (A/B) edition. Read-only root slots with staged,
-automatically-committed updates and boot-time rollback.
-
-## Download
-- [AcreetionOS-Immutable-${VERSION}.iso](https://iso.acreetionos.org/AcreetionOS-Immutable-${VERSION}.iso)
-- [SHA256SUMS](https://iso.acreetionos.org/SHA256SUMS)
-- [MD5SUMS](https://iso.acreetionos.org/MD5SUMS)
-
-Verify with \`sha256sum -c SHA256SUMS\`."
+            --notes-file NOTES.md
