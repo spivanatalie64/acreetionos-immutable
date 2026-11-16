@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -57,3 +57,29 @@ jobs:
           path: iso-out/
           if-no-files-found: error
           retention-days: 90
+
+      - name: Post artifact link and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ART_ID="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --jq '.artifacts[0].id')"
+          ART_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts/${ART_ID}"
+          SUMS="$(cat iso-out/SHA256SUMS)"
+          {
+            echo "Latest weekly build of AcreetionOS Immutable, built by the Weekly ISO Build workflow."
+            echo ""
+            echo "- Workflow run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- Download (ISO + SHA256SUMS, .zip artifact): ${ART_URL}"
+            echo ""
+            echo "SHA-256:"
+            echo '```'
+            echo "${SUMS}"
+            echo '```'
+            echo ""
+            echo "Verify after unzipping with \`sha256sum -c SHA256SUMS\`. This is a rolling weekly build, not a stable release -- stable releases stay under their version tags."
+          } > weekly-notes.md
+          if gh release view weekly >/dev/null 2>&1; then
+            gh release edit weekly --title "Weekly build (latest)" --notes-file weekly-notes.md
+          else
+            gh release create weekly --prerelease --title "Weekly build (latest)" --notes-file weekly-notes.md
+          fi
