@@ -1,0 +1,59 @@
+name: Weekly ISO Build
+
+# Builds the AcreetionOS Immutable ISO in GitHub Actions once a week.
+# The finished ISO (plus SHA256SUMS) is uploaded as a workflow artifact:
+# Actions -> Weekly ISO Build -> latest run -> Artifacts.
+# Tagged stable releases are still handled by release.yml.
+
+on:
+  schedule:
+    # Sundays 20:00 UTC = 12:00 Pacific, alongside the weekly retail build
+    - cron: "0 20 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Immutable ISO
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune -af
+          df -h /
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build ISO (privileged Arch container)
+        run: |
+          PARENT="$(dirname "$GITHUB_WORKSPACE")"
+          NAME="$(basename "$GITHUB_WORKSPACE")"
+          docker run --privileged --rm \
+            -v "$PARENT:/work" -w "/work/$NAME" \
+            archlinux:latest \
+            bash -euo pipefail -c '
+              pacman -Syu --noconfirm --needed archiso sudo git
+              git config --global --add safe.directory "*"
+              ./build.sh
+            '
+          mkdir -p "$GITHUB_WORKSPACE/iso-out"
+          cp "$PARENT"/ISO-immutable/*.iso "$GITHUB_WORKSPACE/iso-out/"
+          cd "$GITHUB_WORKSPACE/iso-out"
+          sha256sum *.iso > SHA256SUMS
+          ls -lh
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: acreetionos-immutable-iso
+          path: iso-out/
+          if-no-files-found: error
+          retention-days: 90
