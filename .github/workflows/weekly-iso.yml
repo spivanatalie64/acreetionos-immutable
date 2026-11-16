@@ -40,7 +40,7 @@ jobs:
             -v "$PARENT:/work" -w "/work/$NAME" \
             archlinux:latest \
             bash -euo pipefail -c '
-              pacman -Syu --noconfirm --needed archiso sudo git
+              pacman -Syu --noconfirm --needed archiso grub syslinux mtools dosfstools e2fsprogs squashfs-tools libisoburn cdrtools sudo git
               git config --global --add safe.directory "*"
               ./build.sh
             '
